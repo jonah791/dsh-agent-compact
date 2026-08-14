@@ -1,72 +1,74 @@
-# dsh-agent-compact
+# dsh-agent-compact — DSH 的 Agent 驱动压缩插件
 
-**Agent-driven compaction for DeepSeek Harness (DSH).** Instead of replaying the entire conversation into a separate LLM request, this plugin asks the agent to summarize its *own* conversation — the summary is produced from context the model already holds, hitting the provider KV cache instead of building a giant replay payload.
+**为 DeepSeek Harness (DSH) 打造的 Agent 驱动会话压缩插件。** 与官方后端把整个会话历史重放到独立 LLM 请求里做总结不同，本插件**让 agent 总结自己的对话**——摘要直接从模型已经持有的上下文里产出，命中提供方 KV 缓存，不再构造巨型重放请求。
 
-> Status: working proof-of-concept, verified in a real production session (see [Evidence](#evidence)). DSH is pre-release (0.1.0-rc); no compatibility promise.
+> 状态：可用原型，已在真实生产会话中完整验证（见[实测证据](#实测证据)）。DSH 为预览版（0.1.0-rc），无兼容承诺。
 
-## Problem
+## 问题
 
-The official compaction backend (`@deepseek-ai/dsh-compaction-basic`) summarizes history by **replaying the full surface into a fresh LLM request** (`buildSummarizationInput` has no truncation). When a session grows large, that replay request fails at the transport layer:
+官方压缩后端（`@deepseek-ai/dsh-compaction-basic`）通过把完整 surface 重放进一个新 LLM 请求来做总结（`buildSummarizationInput` 无截断）。当会话膨胀到一定程度，这个重放请求会在传输层失败：
 
-- Real-world failure: session at **~460k input tokens** (664 surface nodes) → `compaction/end` with `error: "DeepSeek API request to https://api.deepseek.com failed"`
-- 5 consecutive `/compact` attempts failed with the same TRANSPORT error as the session grew
-- Every retry re-pays the same cost: a full-history replay, cold cache, doomed to fail again
+- 真实故障：会话膨胀至 **约 46 万 token 输入**（664 个 surface 节点）→ `compaction/end` 报 `error: "DeepSeek API request to https://api.deepseek.com failed"`
+- 连续 5 次 `/compact` 均以同一 TRANSPORT 错误失败；每次重试都重新构造同一个无上限的重放请求
+- 讽刺的是：官方路径在会话小时能成功，随会话膨胀退化为必然失败——而膨胀恰恰是最需要压缩的时刻
 
-## Solution
+## 方案：让 agent 总结自己的上下文
 
-**Let the agent summarize its own context.** The compaction flow becomes:
+压缩流程变为：
 
-1. `compaction/start` — same transaction envelope as official
-2. Inject `AGENT_COMPACTION_INSTRUCTION` into the agent's inbox (next-turn delivery)
-3. The agent writes the checkpoint summary from its **current context** — no replay, no giant request
-4. The summary message is captured (`agentSummarize`) and validated (non-empty, smaller than the original)
-5. `compaction/summary` → surface `replace` → `compaction/end` → flush — **byte-compatible with the official transaction format**
+1. `compaction/start` —— 与官方完全相同的事务封装
+2. 向 agent 的收件箱注入总结指令（next-turn 投递）
+3. agent 基于**当前上下文**直接写出 checkpoint 摘要——提供方的 KV cache 里早已缓存了这些内容
+4. 捕获并校验摘要（`agentSummarize`：非空、比原文小）
+5. `compaction/summary` → surface `replace` → `compaction/end` → flush —— **与官方事务格式字节级兼容**
 
-Measured in the verification session (turn 24, the summarizing turn):
+### 实测证据
 
-| metric | value |
+在同一个曾连续失败 5 次的会话上验证（总结轮 turn 24）：
+
+| 指标 | 数值 |
 |---|---|
 | `inputTokens` | 865 |
-| `cacheReadTokens` | **568,832** (KV cache hit — the agent's own context) |
+| `cacheReadTokens` | **568,832**（KV 缓存命中——agent 自己的上下文） |
 | `outputTokens` | 1,933 |
-| result | `Compacted 664 history items (~460634 tokens)` |
-| `compaction/end` | no `error` field |
+| 结果 | `Compacted 664 history items (~460634 tokens)` |
+| `compaction/end` | 无 `error` 字段 |
 
-## Architecture
+## 架构
 
-`src/index.ts` — `AgentCompactEngine extends CompactionEngine` (from `@deepseek-ai/dsh-compaction`):
+`src/index.ts` —— `AgentCompactEngine extends CompactionEngine`（来自 `@deepseek-ai/dsh-compaction`）：
 
-- `compactNow()` — **agent-driven path** (used by `/compact`): `agentSummarize` captures the agent's own checkpoint message
-- `compactRegion()` / `compactIfNeeded()` — delegate to the official implementation for region/automatic compaction
+- `compactNow()` —— **agent 驱动路径**（`/compact` 命令使用）：`agentSummarize` 捕获 agent 自己产出的 checkpoint 消息
+- `compactRegion()` / `compactIfNeeded()` —— 委托官方实现处理区域压缩与自动压缩
 
-`src/summarizer.ts` — `agentSummarize` (inject instruction, capture the summary turn's `assistant/message`, validate) and `summarizeWithLlm` (official direct-call fallback).
+`src/summarizer.ts` —— `agentSummarize`（注入指令、捕获总结轮的 `assistant/message`、校验）与 `summarizeWithLlm`（官方直调兜底）。
 
-`src/region.ts` — transaction layer: `compaction/start → compaction/summary → user/message replace → compaction/end → flush`, `compactCheckpointSource`, `toolPairingBalancedBefore/After`, balanced-boundary checks.
+`src/region.ts` —— 事务层：`compaction/start → compaction/summary → user/message replace → compaction/end → flush`、`compactCheckpointSource`、`toolPairingBalancedBefore/After`、平衡边界检查。
 
-## Install
+## 安装
 
-Two ways to wire it into a DSH profile:
+两种接入方式：
 
-### A. Drop-in replacement of the official backend (verified)
+### A. 原地替换官方后端（已验证）
 
-The preset files reference the package name `@deepseek-ai/dsh-compaction-basic`, and the Loader resolves that name **from the host process** — a third-party package name in the preset line fails with `MODULE_NOT_FOUND`. The verified wiring therefore replaces the official package's implementation in place:
+预设文件引用包名 `@deepseek-ai/dsh-compaction-basic`，而 Loader 从**宿主进程**解析该包名——预设行里写第三方包名会报 `MODULE_NOT_FOUND`。因此已验证的接入方式是把官方包实现原地替换：
 
-1. Build: `pnpm run build` (emits `lib/`)
-2. Back up `node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js` → `index.js.bak-official`
-3. Copy this package's `lib/{index,region,summarizer,config,types}.js` + `lib/types/` into `node_modules/@deepseek-ai/dsh-compaction-basic/lib/`
+1. 构建：`pnpm run build`（产出 `lib/`）
+2. 备份 `node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js` → `index.js.bak-official`
+3. 把本包的 `lib/{index,region,summarizer,config,types}.js` 与 `lib/types/` 复制进 `node_modules/@deepseek-ai/dsh-compaction-basic/lib/`
 
-Rollback: copy `index.js.bak-official` back.
+回滚：把 `index.js.bak-official` 复制回去即可。
 
-### B. As a standalone package (ideal, blocked upstream)
+### B. 作为独立包接入（理想形态，需上游配合）
 
-The preset name must resolve from the host, so the standalone path needs upstream cooperation: either the official preset gains a pluggable compaction-provider slot, or the Loader gains a profile-scoped resolution fallback. This is the ask in [the upstream discussion](#).
+预设名必须能被宿主解析，所以独立包路径需要上游配合：要么官方预设开放可插拔的压缩 provider 槽位，要么 Loader 增加 profile 级解析回退。这正是[上游讨论帖](#)里提出的诉求。
 
-## Roadmap / upstream ask
+## 路线图 / 给上游的建议
 
-- Short-term: official `buildSummarizationInput` should truncate/stream instead of building an unbounded replay (root cause of the TRANSPORT failures)
-- Medium-term: a pluggable compaction provider so agent-driven summarization can be selected from the preset (this package as the reference implementation)
-- This package is published with the `dsh-plugin` topic per CONTRIBUTING.md
+- 短期：官方 `buildSummarizationInput` 应截断或流式化，而不是构造无上限的重放请求（TRANSPORT 失败的根因）
+- 中期：把压缩总结器做成可插拔 provider，使 agent 驱动总结可从预设中选择——本包即参考实现
+- 本仓库已按 CONTRIBUTING.md 建议挂 `dsh-plugin` topic 发布
 
-## License
+## 许可
 
 MIT
