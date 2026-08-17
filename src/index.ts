@@ -36,6 +36,7 @@ import {
 import {
   assertNoActiveCompaction,
   compactSurfaceRegion,
+  inspectCompactionEntryState,
   selectCompactableRange,
 } from './region.ts'
 import { agentSummarize, summarizeWithLlm } from './summarizer.ts'
@@ -107,9 +108,13 @@ const modelPolicy: z<ModelCompactPolicyConfig> = z.object({
 })
 
 /**
- * Agent-driven compaction backend. `compactNow` asks the owning agent to
- * summarize its own conversation; automatic paths use the official replay
- * summarizer (bounded by the routed model's context window).
+ * Agent-driven compaction backend. `compactNow` can run at any moment
+ * ("想压就压"): an idle session compacts synchronously, while a busy session
+ * queues the summarization instruction into the agent's inbox — the agent's
+ * next output after its current thinking IS the summary, and the replacement
+ * happens as soon as it lands; the command returns immediately either way.
+ * Automatic paths use the official replay summarizer (bounded by the routed
+ * model's context window).
  */
 export class AgentCompactEngine extends CompactionEngine {
   static inject = ['llm', 'tokenMeter', 'sessions']
@@ -271,39 +276,51 @@ export class AgentCompactEngine extends CompactionEngine {
         'manual compaction is already running for this agent',
       )
     }
-    if (agent.status !== 'idle' || agent.inbox.hasPending) {
-      throw new ManualCompactionError(
-        'busy',
-        'manual compaction requires an idle agent with no waking queued work',
-      )
-    }
+    const range = selectCompactableRange(
+      agent.session,
+      this.ctx.tokenMeter.measure(agent.session),
+      0,
+    )
+    if (range === null) return Promise.resolve(null)
+    const entryState = inspectCompactionEntryState(agent.session.events)
+    const owner = entryState.openTurn === null ? null : 'current-turn'
     this.active.add(agent.id)
-    try {
-      const range = selectCompactableRange(
-        agent.session,
-        this.ctx.tokenMeter.measure(agent.session),
-        0,
-      )
-      if (range === null) return Promise.resolve(null)
-      return compactSurfaceRegion(
-        this.agentDependencies(agent),
-        agent.session,
-        range.start,
-        range.end,
-        agent,
-        {
-          owner: null,
-          stability: 'selected-span',
-          ...sourceCommandId === undefined ? {} : { sourceCommandId },
-          flush: async () => {
-            await this.ctx.sessions.flush(agent.session)
-          },
+    const run = (): Promise<CompactionResult> => compactSurfaceRegion(
+      this.agentDependencies(agent),
+      agent.session,
+      range.start,
+      range.end,
+      agent,
+      {
+        owner,
+        stability: 'selected-span',
+        ...sourceCommandId === undefined ? {} : { sourceCommandId },
+        flush: async () => {
+          await this.ctx.sessions.flush(agent.session)
         },
-        signal,
+      },
+      signal,
+    )
+    if (owner === null) {
+      // 空闲会话：同步执行，命令等待真实结果。
+      return run().then(
+        (result) => { this.active.delete(agent.id); return result },
+        (error) => { this.active.delete(agent.id); throw error },
       )
-    } finally {
-      this.active.delete(agent.id)
     }
+    // 会话正忙：想压就压——总结指令排入 inbox，agent 当前思维结束后的下一次
+    // 输出即总结，产生后即替换；命令立即确认，不阻塞正在进行的思考。
+    void run().then(
+      () => this.active.delete(agent.id),
+      (error) => {
+        this.active.delete(agent.id)
+        const message = error instanceof Error ? error.message : String(error)
+        this.ctx.logger.warn(
+          `queued manual compaction failed: ${message}; the conversation is unchanged`,
+        )
+      },
+    )
+    return Promise.resolve(null)
   }
 
   /** Bind the token meter and the official replay summarizer (automatic paths). */
@@ -411,4 +428,3 @@ export class AgentCompactEngine extends CompactionEngine {
 }
 
 export default AgentCompactEngine
-

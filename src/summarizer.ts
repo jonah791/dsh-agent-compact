@@ -277,6 +277,34 @@ export const AGENT_COMPACTION_INSTRUCTION = [
 ].join('\n')
 
 /**
+ * 等总结轮完成（busy 会话替代 whenIdle）：指令后第一个新 turn 的 assistant 消息出现后，
+ * 一旦观察到更新的 turn（或超时）即视为总结轮结束。
+ */
+async function waitSummaryTurn(
+  session: { readonly events: ReadonlyArray<{ readonly type?: string; readonly data?: unknown }> },
+  seqFloor: number,
+  timeoutMs: number,
+): Promise<void> {
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
+  const start = Date.now()
+  let targetTurn: number | null = null
+  while (Date.now() - start < timeoutMs) {
+    let lastTurn = -1
+    for (let index = seqFloor; index < session.events.length; index += 1) {
+      const event = session.events[index]
+      if (event === undefined || event.type !== 'assistant/message') continue
+      const turn = (event.data as { turn?: number } | undefined)?.turn ?? -1
+      if (turn > lastTurn) lastTurn = turn
+    }
+    if (lastTurn >= 0) {
+      if (targetTurn === null) targetTurn = lastTurn
+      else if (lastTurn > targetTurn) return // 新 turn 开始 = 总结轮完成
+    }
+    await sleep(1000)
+  }
+}
+
+/**
  * Deliver the compaction instruction to the agent and capture its summarizing
  * reply as the checkpoint summary.
  * @param ctx - plugin context (for logging).
@@ -314,20 +342,26 @@ export async function agentSummarize(
       'next-turn',
       true,
     )
-    await agent.whenIdle()
+    // busy 会话修复：agent.whenIdle() 等「agent 完全无活动」——对话中的 agent 每轮都在动，
+    // 永不 resolve → 压缩挂起。改为等「总结轮 turn 完成」：指令后第一个新 turn 出现
+    // assistant 消息后，一旦出现更新的 turn 即视为总结轮结束。
+    await waitSummaryTurn(session, seqFloor, 120000)
   } finally {
     if (signal !== undefined) signal.removeEventListener('abort', onAbort)
   }
   if (signal?.aborted) throw new LlmError('agent summarization was cancelled', 'ABORTED')
 
-  // The summarizing turn produced exactly one assistant message (it was told
-  // not to call tools); take the LAST one so a stray earlier message cannot win.
+  // 捕获总结轮（targetTurn）的 assistant 消息——不是「最后一个」（后续轮会污染）
   let message: Message | undefined
   let usage: TokenUsage | undefined
   const events = session.events
+  let targetTurn: number | undefined
   for (let index = seqFloor; index < events.length; index += 1) {
     const event = events[index]
     if (event === undefined || event.type !== 'assistant/message') continue
+    const turn = (event.data as { turn?: number }).turn
+    if (targetTurn === undefined) targetTurn = turn
+    if (turn !== targetTurn) continue // 只取总结轮
     message = event.data.message
     if (event.data.usage !== undefined) usage = event.data.usage
   }
