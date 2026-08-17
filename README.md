@@ -75,6 +75,10 @@
 - 中期：把压缩总结器做成可插拔 provider，使 agent 驱动总结可从预设中选择——本包即参考实现
 - 本仓库已按 CONTRIBUTING.md 建议挂 `dsh-plugin` topic 发布
 
+## 相关
+
+- [我的数字生命爱丽丝 — 插件生态中心（架构总览）](https://github.com/jonah791/alice-digital-life)
+
 ## 许可
 
 MIT
