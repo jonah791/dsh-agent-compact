@@ -1,3 +1,13 @@
+<!--
+  DSH 插件生态公约声明（plugin-ecosystem-convention · 组合优先/声明清晰/兼容优先）
+  purpose: Agent-driven compaction for DeepSeek Harness: the agent summarizes its own conversation (KV-cache friendly, no giant replay requests), replacing the official replay-based compaction-basic.
+  inject: 'llm','tokenMeter','sessions'
+  tools: （无，注入压缩服务）
+  runtime: host-only
+  envDeps: 无（纯逻辑/标准 Node）
+  boundary: 无特殊授权边界
+  compat: cordis ^4.0.1 / dsh-tools ^0.1.0-rc.6
+-->
 # dsh-agent-compact — DSH 的 Agent 驱动压缩插件
 
 **为 DeepSeek Harness (DSH) 打造的 Agent 驱动会话压缩插件。** 与官方后端把整个会话历史重放到独立 LLM 请求里做总结不同，本插件**让 agent 总结自己的对话**——摘要直接从模型已经持有的上下文里产出，命中提供方 KV 缓存，不再构造巨型重放请求。
