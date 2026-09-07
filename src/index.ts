@@ -282,7 +282,7 @@ export class AgentCompactEngine extends CompactionEngine {
       0,
     )
     if (range === null) return Promise.resolve(null)
-    const entryState = inspectCompactionEntryState(agent.session.events)
+    const entryState = inspectCompactionEntryState(agent.session as any)
     const owner = entryState.openTurn === null ? null : 'current-turn'
     this.active.add(agent.id)
     const run = (): Promise<CompactionResult> => compactSurfaceRegion(

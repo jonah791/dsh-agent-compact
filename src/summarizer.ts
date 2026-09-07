@@ -281,7 +281,7 @@ export const AGENT_COMPACTION_INSTRUCTION = [
  * 一旦观察到更新的 turn（或超时）即视为总结轮结束。
  */
 async function waitSummaryTurn(
-  session: { readonly events: ReadonlyArray<{ readonly type?: string; readonly data?: unknown }> },
+  session: { seq: number; eventAt(seq: number): { readonly type?: string; readonly data?: unknown } | undefined },
   seqFloor: number,
   timeoutMs: number,
 ): Promise<void> {
@@ -290,8 +290,8 @@ async function waitSummaryTurn(
   let targetTurn: number | null = null
   while (Date.now() - start < timeoutMs) {
     let lastTurn = -1
-    for (let index = seqFloor; index < session.events.length; index += 1) {
-      const event = session.events[index]
+    for (let index = seqFloor; index < session.seq; index += 1) {
+      const event = session.eventAt(index)
       if (event === undefined || event.type !== 'assistant/message') continue
       const turn = (event.data as { turn?: number } | undefined)?.turn ?? -1
       if (turn > lastTurn) lastTurn = turn
@@ -318,9 +318,14 @@ export async function agentSummarize(
   signal?: AbortSignal,
 ): Promise<SummaryResult> {
   const session = agent.session
+  // alpha.1 适配：session.events 已移除，用 seq + eventAt（宽松结构断言）
+  const sessionView = session as unknown as {
+    seq: number
+    eventAt(seq: number): { type?: string; data?: unknown } | undefined
+  }
   // Snapshot before the injection: everything appended from here on belongs to
   // the summarizing turn and must not be shadowed.
-  const seqFloor = session.events.length
+  const seqFloor = sessionView.seq
 
   const onAbort = (): void => {
     try {
@@ -345,7 +350,7 @@ export async function agentSummarize(
     // busy 会话修复：agent.whenIdle() 等「agent 完全无活动」——对话中的 agent 每轮都在动，
     // 永不 resolve → 压缩挂起。改为等「总结轮 turn 完成」：指令后第一个新 turn 出现
     // assistant 消息后，一旦出现更新的 turn 即视为总结轮结束。
-    await waitSummaryTurn(session, seqFloor, 120000)
+    await waitSummaryTurn(sessionView, seqFloor, 120000)
   } finally {
     if (signal !== undefined) signal.removeEventListener('abort', onAbort)
   }
@@ -354,16 +359,16 @@ export async function agentSummarize(
   // 捕获总结轮（targetTurn）的 assistant 消息——不是「最后一个」（后续轮会污染）
   let message: Message | undefined
   let usage: TokenUsage | undefined
-  const events = session.events
   let targetTurn: number | undefined
-  for (let index = seqFloor; index < events.length; index += 1) {
-    const event = events[index]
+  for (let index = seqFloor; index < sessionView.seq; index += 1) {
+    const event = sessionView.eventAt(index)
     if (event === undefined || event.type !== 'assistant/message') continue
-    const turn = (event.data as { turn?: number }).turn
+    const data = event.data as { turn?: number; message?: Message; usage?: TokenUsage }
+    const turn = data.turn
     if (targetTurn === undefined) targetTurn = turn
     if (turn !== targetTurn) continue // 只取总结轮
-    message = event.data.message
-    if (event.data.usage !== undefined) usage = event.data.usage
+    message = data.message
+    if (data.usage !== undefined) usage = data.usage
   }
   if (message === undefined) {
     throw new Error('agent summarization produced no assistant message')

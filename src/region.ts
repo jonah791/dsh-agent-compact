@@ -160,7 +160,7 @@ export async function compactSurfaceRegion(
 ): Promise<CompactionResult> {
   if (options.owner === null) signal?.throwIfAborted()
   const selection = validateSurfaceRegion(session, start, end)
-  const entryState = inspectCompactionEntryState(session.events)
+  const entryState = inspectCompactionEntryState(session as unknown as { seq: number; eventAt(seq: number): SessionEvent | undefined })
   assertCompactionInactive(
     entryState.unmatchedCompactionStart,
     entryState.latestEndSeedSeq,
@@ -303,7 +303,7 @@ function assertCompactionInactive(
  * @param stage - operation label included in the busy diagnostic.
  */
 export function assertNoActiveCompaction(session: Session, stage: string): void {
-  const entryState = inspectCompactionEntryState(session.events)
+  const entryState = inspectCompactionEntryState(session as unknown as { seq: number; eventAt(seq: number): SessionEvent | undefined })
   assertCompactionInactive(
     entryState.unmatchedCompactionStart,
     entryState.latestEndSeedSeq,
@@ -500,11 +500,9 @@ function buildSummarizationInput(
   shadowedSeqs: readonly number[],
 ): SummarizationInput {
   const header = session.requestHeader()
-  const events = session.events
   const regionMessages = shadowedSeqs
     // shadowedSeqs are current surface seqs, so each is a valid log index.
-    // oxlint-disable-next-line typescript/no-non-null-assertion
-    .map(seq => session.deriveEventMessage(events[seq]!))
+    .map(seq => session.deriveEventMessage((session as unknown as { eventAt(seq: number): SessionEvent | undefined }).eventAt(seq)!))
     .filter((message): message is Message => message !== null)
   return {
     ...header?.system === undefined ? {} : { system: header.system },
@@ -514,15 +512,16 @@ function buildSummarizationInput(
 }
 
 /** Inspect open-turn, unmatched-compaction, and latest seed-boundary state independently. */
-export function inspectCompactionEntryState(events: readonly SessionEvent[]): CompactionEntryState {
+export function inspectCompactionEntryState(session: { seq: number; eventAt(seq: number): SessionEvent | undefined }): CompactionEntryState {
   let openTurn: number | null = null
   let openTurnStateKnown = false
   let unmatchedCompactionStart: SessionEvent<'compaction/start'> | undefined
   let compactionEntryStateKnown = false
   let latestEndSeedSeq: number | undefined
-  for (let index = events.length - 1; index >= 0; index -= 1) {
+  for (let index = session.seq - 1; index >= 0; index -= 1) {
     // oxlint-disable-next-line typescript/no-non-null-assertion
-    const event = events[index]!
+    const event = session.eventAt(index)
+    if (event === undefined) continue
     if (latestEndSeedSeq === undefined && event.type === 'session/end-seed') {
       latestEndSeedSeq = event.seq
     }
