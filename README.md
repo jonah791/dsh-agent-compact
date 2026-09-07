@@ -10,6 +10,12 @@
 -->
 # dsh-agent-compact — DSH 的 Agent 驱动压缩插件
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-compact"><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 **为 DeepSeek Harness (DSH) 打造的 Agent 驱动会话压缩插件。** 与官方后端把整个会话历史重放到独立 LLM 请求里做总结不同，本插件**让 agent 总结自己的对话**——摘要直接从模型已经持有的上下文里产出，命中提供方 KV 缓存，不再构造巨型重放请求。
 
 > 状态：可用原型，已在真实生产会话中完整验证（见[实测证据](#实测证据)）。DSH 为预览版（0.1.0-rc），无兼容承诺。
