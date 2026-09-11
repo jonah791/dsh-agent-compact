@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Surface retention selection and the shared log-recorded compaction
  * transaction for automatic open-turn and manual idle-session compaction.
  *
@@ -19,7 +19,7 @@ import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
 import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
 import type { Message, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { TokenMeasurement, TokenMeter } from '@deepseek-ai/dsh-token-meter'
-import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { frameSummary } from './summarizer.ts'
 import type { SummarizationInput, SummaryResult } from './summarizer.ts'
@@ -311,11 +311,26 @@ export function assertNoActiveCompaction(session: Session, stage: string): void 
   )
 }
 
+/**
+ * 编译期 brand 助手：把插件内的裸 number 标成宿主 branded `SessionSeq`。
+ *
+ * 为何不 import 宿主的 `SessionSeq()` 函数（2026-09-11 实测教训）：本插件被**两条路径**加载——
+ * ① 自身目录（解析到宿主 workspace，单实例）；② 经 `dsh-compact-provider` 的 pnpm `file:`
+ * 打包副本（其 `node_modules/@deepseek-ai/*` 是 registry 陈旧副本 0.1.0-rc.8，**不导出**
+ * `SessionSeq`）→ 引入运行期命名导入会让 ② 直接 ERR（本日实测：加载即崩）。
+ * 而 brand 是**纯类型层**构造（`SessionSeq = BrandedNumber<'SessionSeq'>`），运行时语义由
+ * `session.append` 的 `isEventSeq`（非负安全整数）+ 表层成员校验承担——那才是权威校验点。
+ * 故此处只做类型转换，不引入运行期依赖。
+ */
+function seqOf(value: number): SessionSeq {
+  return value as SessionSeq
+}
+
 /** Validate one requested surface-position span before asynchronous work begins. */
 function validateSurfaceRegion(session: Session, start: number, end: number): SurfaceSelection {
   const nodes = session.surface.nodes
-  const startIdx = nodes.indexOf(start)
-  const endIdx = nodes.indexOf(end)
+  const startIdx = nodes.indexOf(seqOf(start))
+  const endIdx = nodes.indexOf(seqOf(end))
   if (startIdx === -1) throw new Error(`compactRegion: start seq ${start} not found in surface`)
   if (endIdx === -1) throw new Error(`compactRegion: end seq ${end} not found in surface`)
   if (startIdx > endIdx) {
@@ -451,8 +466,8 @@ function commitCompactionBody(
       : { sourceCommandId: startEvent.data.sourceCommandId },
     summary,
     ...callProvenance,
-    shadowedRange: { start, end },
-    shadowedSeqs: [...shadowedSeqs],
+    shadowedRange: { start: seqOf(start), end: seqOf(end) },
+    shadowedSeqs: shadowedSeqs.map(seqOf),
     shadowedTokenCount,
     provider,
     model,
@@ -465,8 +480,8 @@ function commitCompactionBody(
     // 键名与键数（Object.keys(op).length === 3），旧形态 {op,start,end} 会被
     // append 处 fail-loud 拒绝（compaction/end.error = "invalid replace surfaceOp"）
     // → 摘要写入成功但表层未被替换 → 上下文永不缩小（09-10 至 09-11 十次压缩全失败）
-    surfaceOp: { op: 'replace', startSeq: start, endSeq: end },
-    sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs],
+    surfaceOp: { op: 'replace', startSeq: seqOf(start), endSeq: seqOf(end) },
+    sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs.map(seqOf)],
   })
   return {
     compactionId: startEvent.data.compactionId,
@@ -476,8 +491,8 @@ function commitCompactionBody(
     startSeq: startEvent.seq,
     summarySeq: summaryEvent.seq,
     summary,
-    shadowedRange: { start, end },
-    shadowedSeqs: [...shadowedSeqs],
+    shadowedRange: { start: seqOf(start), end: seqOf(end) },
+    shadowedSeqs: shadowedSeqs.map(seqOf),
     shadowedTokenCount,
   }
 }
@@ -500,19 +515,45 @@ function completeCompaction(
  * @param shadowedSeqs - the surface-node seqs, in order, being compacted.
  * @returns the replayed conversation prefix to condense.
  */
+/**
+ * The `system/message` holding surface node 0, or `undefined` when another
+ * message-producing event starts the surface.
+ */
+function systemHead(session: Session, headSeq: number): SessionEvent<'system/message'> | undefined {
+  const head = session.eventAt(seqOf(headSeq))
+  return head !== undefined && head.type === 'system/message' ? head : undefined
+}
+
+/**
+ * Reconstruct the last routed request's cacheable prefix for the shadowed
+ * region: the system prompt held by the `system/message` at surface node 0,
+ * the header's tool schemas, then the region's own derived messages in surface
+ * order.
+ *
+ * 宿主迁移（0.1.5-rc.1，2026-09-11）：system prompt 不再是 `EpochHeader.system`
+ * 字段，而是 surface 节点 0 的 `system/message` 事件（EpochHeader 注释：system prompt
+ * 是派生历史）。本函数改为与官方 compaction-basic `buildSummarizationInput` 同款还原
+ * ——否则 header.system 恒 undefined，压缩请求会丢掉 system prompt（静默降质）。
+ *
+ * @param session - session supplying the surface head, request header, and per-node projection.
+ * @param shadowedSeqs - the surface-node seqs, in order, being compacted.
+ * @returns the replayed conversation prefix to condense.
+ */
 function buildSummarizationInput(
   session: Session,
   shadowedSeqs: readonly number[],
 ): SummarizationInput {
   const header = session.requestHeader()
+  const headSeq = session.surface.nodes[0]
+  const head = headSeq === undefined ? undefined : systemHead(session, headSeq)
+  const system = head === undefined ? null : session.deriveEventMessage(head)
   const regionMessages = shadowedSeqs
-    // shadowedSeqs are current surface seqs, so each is a valid log index.
-    .map(seq => session.deriveEventMessage((session as unknown as { eventAt(seq: number): SessionEvent | undefined }).eventAt(seq)!))
+    // shadowedSeqs are current surface seqs, so each is a valid log index（官方同款断言）。
+    .map(seq => session.deriveEventMessage(session.eventAt(seqOf(seq))!))
     .filter((message): message is Message => message !== null)
   return {
-    ...header?.system === undefined ? {} : { system: header.system },
     ...header?.tools === undefined ? {} : { tools: header.tools },
-    messages: regionMessages,
+    messages: system === null ? regionMessages : [system, ...regionMessages],
   }
 }
 

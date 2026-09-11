@@ -32,8 +32,8 @@
     "typescript": "^5.9.3"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json --noCheck",
-    "typecheck": "tsc -p tsconfig.json --noEmit --noCheck"
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
-  "_comment_typeDrift": "构建用 --noCheck：本仓 plugin 的 @deepseek-ai/dsh-session 类型来自 registry（滞后，仍声明旧形态 {op,start,end}），而运行时是宿主 workspace（deepseek-harness 0.1.5-rc.1，契约为 {op,startSeq,endSeq}）。源码以宿主契约书写（权威），类型检查交给宿主仓；详见 AGENTS.md 会话事件契约条。"
+  "_comment_typeResolution": "本插件的 @deepseek-ai/* 由宿主 link farm（E:/alice/node_modules）解析到 deepseek-harness workspace 单实例——本目录 node_modules 下不得存在 @deepseek-ai 真实副本（会遮蔽宿主、导致 API/class 身份漂移）。2026-09-11 已清理；构建恢复全量类型检查（tsc 对宿主契约报错即说明有漂移，必须修源码而非跳过检查）。"
 }
