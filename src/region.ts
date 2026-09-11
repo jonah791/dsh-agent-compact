@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Surface retention selection and the shared log-recorded compaction
  * transaction for automatic open-turn and manual idle-session compaction.
  *
@@ -109,6 +109,15 @@ export function selectCompactableRange(
     throw new Error('compaction: token-meter surface does not match the current session surface')
   }
 
+  // surface node 0 若持有 system prompt，它**永不进入压缩区间**（2026-09-11 修复）。
+  // 宿主在 `core/session/src/surface.ts` 的 assertSystemHeadRewrite 处 fail-loud：
+  // 「surface replace: node 0 holds the system prompt and may be rewritten only by a
+  //  system/message over exactly that node」——旧实现硬编码 start=surfaceNodes[0]，
+  // 于是每次压缩都被拒（摘要成功、替换体丢弃、上下文永不缩小）。
+  // 与官方 compaction-basic `selectCompactableRange` 同款：有 system head 时区间始于 node 1。
+  const headSeq = surfaceNodes[0]
+  const firstIdx = headSeq === undefined || systemHead(session, headSeq) === undefined ? 0 : 1
+
   let accumulated = 0
   let keepFromIdx = pricedNodes.length
   for (let index = pricedNodes.length - 1; index >= 0; index -= 1) {
@@ -117,17 +126,17 @@ export function selectCompactableRange(
     keepFromIdx = index
     if (accumulated >= retainTokens) break
   }
-  if (keepFromIdx === 0) return null
+  if (keepFromIdx <= firstIdx) return null
 
-  while (keepFromIdx > 0) {
+  while (keepFromIdx > firstIdx) {
     // oxlint-disable-next-line typescript/no-non-null-assertion
     if (toolPairingBalancedBefore(session, surfaceNodes[keepFromIdx]!)) break
     keepFromIdx -= 1
   }
-  if (keepFromIdx === 0) return null
+  if (keepFromIdx <= firstIdx) return null
 
   // oxlint-disable-next-line typescript/no-non-null-assertion
-  const first = surfaceNodes[0]!
+  const first = surfaceNodes[firstIdx]!
   // oxlint-disable-next-line typescript/no-non-null-assertion
   const cutoff = surfaceNodes[keepFromIdx - 1]!
   return { start: first, end: cutoff }
