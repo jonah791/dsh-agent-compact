@@ -460,7 +460,12 @@ function commitCompactionBody(
     ...usage === undefined ? {} : { usage },
   })
   session.append('user/message', checkpointMessage, {
-    surfaceOp: { op: 'replace', start, end },
+    // V3 canonical envelope 契约（2026-09-10 修复）：surface replace 必须是
+    // 精确三键 {op,startSeq,endSeq}——core/session/surface.ts isReplaceOp 校验
+    // 键名与键数（Object.keys(op).length === 3），旧形态 {op,start,end} 会被
+    // append 处 fail-loud 拒绝（compaction/end.error = "invalid replace surfaceOp"）
+    // → 摘要写入成功但表层未被替换 → 上下文永不缩小（09-10 至 09-11 十次压缩全失败）
+    surfaceOp: { op: 'replace', startSeq: start, endSeq: end },
     sourceEventSeqs: [startEvent.seq, summaryEvent.seq, ...shadowedSeqs],
   })
   return {
