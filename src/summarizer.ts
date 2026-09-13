@@ -374,6 +374,54 @@ async function waitSummaryTurn(
   }
 }
 
+/** 总结指令在模型可见表层出现的证据。 */
+export interface InstructionSurfaceEvidence {
+  /** 表层是否出现过该指令。 */
+  surfaced: boolean
+  /** 出现过该指令的表层事件 seq 列表。 */
+  seqs: number[]
+}
+
+/**
+ * 判据：总结指令是否**真的进入过模型可见表层**。
+ *
+ * 为什么需要这条前置条件（2026-09-13 事件流取证）：投递管线里「入队」
+ * （`agent/inbox/spliced` 带 inserted）与「排空」（同类型事件带 removedCount）只是**同一次
+ * 投递的两个生命周期事件**——把它们当两次投递会误判成「双投递」（旧版取证脚本正是如此，
+ * 已证伪）。真正决定成败的是**表层**：只有当指令出现在 `user/message` 里，模型才可能产出
+ * checkpoint。turn 29（compaction 9ce76cec）实测 queued=1 / surfaced=0：指令入队却没进表层，
+ * 120s 超时后捕获到了别的工作文本（117 字符，由长度下限拒收）。长度下限只挡碎片，本判据挡的是
+ * **长工作文本**被当成 checkpoint 换掉历史的那种损坏。
+ *
+ * @param view - 会话事件视图（当前 seq + 按序取事件）
+ * @param seqFloor - 注入前的 seq 下界：只有其后的表层事件才属于总结轮
+ * @param instruction - 期望出现的指令文本（默认 {@link AGENT_COMPACTION_INSTRUCTION}）
+ * @returns 表层证据：是否出现 + 出现位置
+ */
+export function instructionSurfaced(
+  view: { seq: number; eventAt(seq: number): { type?: string; data?: unknown } | undefined },
+  seqFloor: number,
+  instruction: string = AGENT_COMPACTION_INSTRUCTION,
+): InstructionSurfaceEvidence {
+  // 比对用前缀：口令文本可能被微调，60 字符前缀足以判定「是同一条指令」而不会误配别人的消息
+  const needle = instruction.slice(0, 60)
+  const seqs: number[] = []
+  for (let index = seqFloor; index < view.seq; index += 1) {
+    const event = view.eventAt(index)
+    if (event === undefined || event.type !== 'user/message') continue
+    const content = (event.data as { message?: { content?: unknown } } | undefined)?.message?.content
+    if (!Array.isArray(content)) continue
+    for (const block of content) {
+      const candidate = block as { type?: string; text?: unknown }
+      if (candidate.type === 'text' && typeof candidate.text === 'string' && candidate.text.includes(needle)) {
+        seqs.push(index)
+        break
+      }
+    }
+  }
+  return { surfaced: seqs.length > 0, seqs }
+}
+
 /**
  * Deliver the compaction instruction to the agent and capture its summarizing
  * reply as the checkpoint summary.
@@ -425,6 +473,18 @@ export async function agentSummarize(
     if (signal !== undefined) signal.removeEventListener('abort', onAbort)
   }
   if (signal?.aborted) throw new LlmError('agent summarization was cancelled', 'ABORTED')
+
+  // 捕获前置条件（2026-09-13）：指令必须真的进过模型可见表层——**入队 ≠ 模型看见**。
+  // 拿不到这条证据时宁可压不成（fail loud，compaction/end.error 可见），也不拿可能是
+  // 工作前言的文本去替换会话历史。
+  const surface = instructionSurfaced(sessionView, seqFloor)
+  if (!surface.surfaced) {
+    throw new Error(
+      'agent summarization instruction never reached the model-visible surface after seq '
+      + String(seqFloor) + '（入队成功但模型未看见）——拒绝捕获；同类事故见 compaction 9ce76cec',
+    )
+  }
+  ctx.logger.info('总结指令已进入表层：seq=' + surface.seqs.join(','))
 
   // 捕获总结轮（targetTurn）的 assistant 消息——**按判据选**，不是「最后一个」：
   // 一个 turn 内可有多条 assistant 消息（输出 checkpoint 后又在同一轮继续工作），
