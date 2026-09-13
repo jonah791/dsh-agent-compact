@@ -22,6 +22,13 @@ const SUMMARY_OPEN_TAG = '<compacted-summary>'
 const SUMMARY_CLOSE_TAG = '</compacted-summary>'
 
 /**
+ * 可信 checkpoint 的最小字符数（2026-09-13 碎片拒收地板）。
+ * 真实 checkpoint 的量级是数千字符（历史样本 4637 / 4685 / 5599）；低于地板只可能是
+ * 「捕获到了别的东西」（事故：117 字符的工作前言）→ fail loud 让压缩失败可见，而不是静默损坏历史。
+ */
+const MIN_PLAUSIBLE_SUMMARY_CHARS = 200
+
+/**
  * The summarization directive, delivered as the FINAL user message after the
  * replayed conversation rather than as a distinct summarizer system prompt.
  * Keeping the conversation's own system prompt, tools, and message prefix in
@@ -276,6 +283,59 @@ export const AGENT_COMPACTION_INSTRUCTION = [
   '- The summary must be substantially shorter than the conversation (a few thousand tokens at most); if the conversation already contains a <compacted-summary> block, merge it with newer information into ONE consolidated summary instead of copying it forward.',
 ].join('\n')
 
+/** 总结轮的候选 assistant 消息（同一 turn 内可有多条——一个 turn 含多个 step）。 */
+export interface SummaryCandidate {
+  turn: number | undefined
+  /** 该消息文本块拼接（判定用） */
+  text: string
+}
+
+/**
+ * 从总结轮的候选消息中**按判据**选出承载 checkpoint 的那一条（纯函数，可离线单测）。
+ *
+ * 2026-09-13 事故：总结轮内可有多条 assistant 消息——我在输出 checkpoint（5599 字符、含
+ * `<compacted-summary>`）之后，又在**同一轮**里继续干活（工具调用 × 4），旧实现「后者覆盖前者」
+ * 取到最后一条 → 捕获到 117 字符的工作前言，真正的 checkpoint 被丢弃：
+ * 记忆「保底存档」与**会话表层替换体**双错（旧历史被 117 字符替换）。
+ *
+ * 判据（依序）：① 含 `<compacted-summary>` 块者优先（其中取最长）；② 否则取文本最长者
+ * （指令要求「整条回复即 checkpoint」，工作前言恒短于 checkpoint）；③ 全空 → null（调用方 fail loud）。
+ * 显式排除「取最后一条」——顺序与语义无关，长度/标记才有关系。
+ */
+export function selectSummaryCandidate(
+  candidates: readonly SummaryCandidate[],
+): { index: number; reason: string } | null {
+  let tagged = -1
+  let taggedLen = -1
+  let longest = -1
+  let longestLen = -1
+  for (let index = 0; index < candidates.length; index += 1) {
+    const text = candidates[index]!.text
+    const length = text.trim().length
+    if (length === 0) continue
+    if (length > longestLen) {
+      longest = index
+      longestLen = length
+    }
+    if (text.includes(SUMMARY_OPEN_TAG) || text.includes(SUMMARY_CLOSE_TAG)) {
+      if (length > taggedLen) {
+        tagged = index
+        taggedLen = length
+      }
+    }
+  }
+  if (tagged >= 0) {
+    return { index: tagged, reason: '含 <compacted-summary> 块（' + String(taggedLen) + ' 字符）' }
+  }
+  if (longest >= 0) {
+    return {
+      index: longest,
+      reason: '无标记块 → 取最长文本（' + String(longestLen) + ' 字符 / 共 ' + String(candidates.length) + ' 条候选）',
+    }
+  }
+  return null
+}
+
 /**
  * 等总结轮完成（busy 会话替代 whenIdle）：指令后第一个新 turn 的 assistant 消息出现后，
  * 一旦观察到更新的 turn（或超时）即视为总结轮结束。
@@ -290,16 +350,26 @@ async function waitSummaryTurn(
   let targetTurn: number | null = null
   while (Date.now() - start < timeoutMs) {
     let lastTurn = -1
+    let targetTurnEnded = false
     for (let index = seqFloor; index < session.seq; index += 1) {
       const event = session.eventAt(index)
-      if (event === undefined || event.type !== 'assistant/message') continue
-      const turn = (event.data as { turn?: number } | undefined)?.turn ?? -1
-      if (turn > lastTurn) lastTurn = turn
+      if (event === undefined) continue
+      if (event.type === 'assistant/message') {
+        const turn = (event.data as { turn?: number } | undefined)?.turn ?? -1
+        if (turn > lastTurn) lastTurn = turn
+      } else if (event.type === 'turn/end') {
+        // 2026-09-13 修复：目标轮**封口**即可收尾。旧实现只认「更新的 turn 出现」，而 agent 可在
+        // 同一轮里持续工作（输出 checkpoint 后继续调工具 → 一直不出新 turn）→ 白等满 120s
+        // （实测 compaction/start 11:06:48 → summary 11:08:48 = 120.0s，正好是这里的 timeout）。
+        const endedTurn = (event.data as { turn?: number } | undefined)?.turn
+        if (targetTurn !== null && endedTurn === targetTurn) targetTurnEnded = true
+      }
     }
     if (lastTurn >= 0) {
       if (targetTurn === null) targetTurn = lastTurn
       else if (lastTurn > targetTurn) return // 新 turn 开始 = 总结轮完成
     }
+    if (targetTurnEnded) return
     await sleep(1000)
   }
 }
@@ -356,9 +426,10 @@ export async function agentSummarize(
   }
   if (signal?.aborted) throw new LlmError('agent summarization was cancelled', 'ABORTED')
 
-  // 捕获总结轮（targetTurn）的 assistant 消息——不是「最后一个」（后续轮会污染）
-  let message: Message | undefined
-  let usage: TokenUsage | undefined
+  // 捕获总结轮（targetTurn）的 assistant 消息——**按判据选**，不是「最后一个」：
+  // 一个 turn 内可有多条 assistant 消息（输出 checkpoint 后又在同一轮继续工作），
+  // 顺序与语义无关，只有「含标记块 / 文本长度」能区分 checkpoint 与工作前言。
+  const candidates: Array<{ turn: number | undefined; text: string; message: Message; usage?: TokenUsage }> = []
   let targetTurn: number | undefined
   for (let index = seqFloor; index < sessionView.seq; index += 1) {
     const event = sessionView.eventAt(index)
@@ -367,11 +438,32 @@ export async function agentSummarize(
     const turn = data.turn
     if (targetTurn === undefined) targetTurn = turn
     if (turn !== targetTurn) continue // 只取总结轮
-    message = data.message
-    if (data.usage !== undefined) usage = data.usage
+    if (data.message === undefined) continue
+    candidates.push({
+      turn,
+      text: summaryText(data.message.content).map((block) => block.text).join('\n'),
+      message: data.message,
+      ...data.usage === undefined ? {} : { usage: data.usage },
+    })
   }
-  if (message === undefined) {
+  const picked = selectSummaryCandidate(candidates)
+  if (picked === null) {
     throw new Error('agent summarization produced no assistant message')
+  }
+  if (candidates.length > 1) {
+    ctx.logger.info('总结轮候选 ' + String(candidates.length) + ' 条 → 选定 #' + String(picked.index)
+      + '（' + picked.reason + '；各条长度 ' + candidates.map((c) => c.text.trim().length).join('/') + '）')
+  }
+  const message = candidates[picked.index]!.message
+  const usage = candidates[picked.index]!.usage
+  // 碎片拒收（2026-09-13）：宁可压不成，不可压成错的——旧实现用 117 字符的工作前言替换了数千 token
+  // 的会话历史。真实 checkpoint 的量级是数千字符（历史样本 4637 / 4685 / 5599），200 字符只可能是
+  // 「捕获到了别的东西」，此时 fail loud 让压缩失败可见（compaction/end.error），而不是静默损坏历史。
+  const chosenChars = candidates[picked.index]!.text.trim().length
+  if (chosenChars < MIN_PLAUSIBLE_SUMMARY_CHARS) {
+    throw new Error('agent summarization produced an implausibly small summary ('
+      + String(chosenChars) + ' chars < ' + String(MIN_PLAUSIBLE_SUMMARY_CHARS)
+      + ')：疑似捕获漂移，拒绝以其替换会话历史')
   }
   const summary = summaryText(message.content)
   if (!summary.some((block) => block.text.trim().length > 0)) {
