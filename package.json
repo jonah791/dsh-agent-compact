@@ -1,6 +1,6 @@
 {
   "name": "dsh-agent-compact",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Agent-driven compaction for DeepSeek Harness: the agent summarizes its own conversation (KV-cache friendly, no giant replay requests), replacing the official replay-based compaction-basic.",
   "type": "module",
   "main": "lib/index.js",
