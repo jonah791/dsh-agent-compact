@@ -82,6 +82,28 @@
 | 引擎自身（真机自测） | `src/index.ts:_registerAutomaticCompaction` | 仅 `auto:true`：`agent/pre-step`（压力）、`agent/request-error`（溢出） |
 | 引擎自身 | `src/index.ts:compactNow` | `inspectCompactionEntryState` 定 owner：空闲=同步执行；忙=排队 + 立即返回 |
 
+### 4.5 侧车轨迹 `[MUST]`（`src/trace.ts` · 2026-09-14 补记，此前遗漏文档回修）
+
+**问题**：本插件只把过程写进 `ctx.logger`，而宿主 logger **不落盘** ⇒「谁发的指令 / 投给谁 / 落地没 / 断在哪一段 / 线上跑的是哪个构建」只能靠外部现场写解析脚本反解会话事件流（一次排障写了四段一次性代码）。
+
+**契约**：`<DSH_HOME>/compaction-trace.jsonl`，一行一阶段，`atMs` 单调。**两个写者共用一个文件**（按 `atMs` join 成一笔事务）：
+
+| 写者 | `side` | 阶段 |
+|------|--------|------|
+| 引擎（本插件） | 缺省（向后兼容旧行） | `boot` / `begin` / `queued` / `waited` / `surfaced` / `captured` / `abort` |
+| 入口（`dsh-compact-provider`） | `'provider'` | `requested` / `rejected` / `completed` / `failed` |
+
+**断点即最后一条非 `abort` 阶段**；事务失败必写 `abort`（带 `error` 与已等毫秒数）。
+
+导出的原语（`src/trace.ts`，并被主入口**转出**供 provider 复用）：
+`resolveHome()`（`DSH_HOME` → `homedir()/.dsh`）、`compactionTracePath()`、`serializeTraceEntry()`（稳定键序单行 JSON）、`parseTraceEntries()`（坏行跳过不抛）、`readTraceEntries()`、`buildStamp()`（`<version>@<模块 mtime ms>`——**版本号会说谎，mtime 不会**）、`BUILD`、`appendTraceEntry()`（失败即吞返回 `false`）、`trace()`。
+
+不变量：
+- **I9 判据单一真源**：消费方**必须**经主入口转出复用本模块（`import { compactTrace } from 'dsh-agent-compact'`），**不得**自建第二套路径解析/序列化。
+- **I10 观测绝不反噬**：`appendTraceEntry`/`trace` 吞错返回 `bool`，调用方一律忽略返回值——写不进去绝不破坏压缩主流程。
+- **I11 不得经 `package.json` 子路径导出**：消费方副本的 `package.json` 由 pnpm 重写，新增子路径导出不会同步（2026-09-14 实测 `./trace` 匹配 = False）⇒ `ERR_PACKAGE_PATH_NOT_EXPORTED` 会让 provider 装载失败 = 压缩整体不可用。主入口 `./lib/index.js` 是硬链接（改动即时可见，实测哈希一致）。
+- **I12 轨迹不得成为模型可见输入**（本地产物，非会话事件）。
+
 ## 5 · 边界与信任
 
 - **能力边界 ≠ 沙箱**：本引擎不做「该不该压」的价值判断，也不拦恶意调用（调用方是自有 provider）
@@ -114,6 +136,12 @@
 - 未实现/未验证部分**显式标注**：① `auto:true` 的两条 replay 路径在本部署**未启用**，其行为仅有单测与代码证据 ② 重发路径尚无真实失败样本（A6 待线上验收）
 
 ## 9 · 实践修订记录
+
+- **2026-09-14 侧车轨迹 + 文档回修（可维护性补课）**
+  - 语义**被补充**：新增 §4.5——`src/trace.ts` 把事务过程落成 `<DSH_HOME>/compaction-trace.jsonl`（此前只写 `ctx.logger`，而宿主 logger **不落盘**）。**本文档此前遗漏了这次回修**（§5.20 I3 违规），本次补齐。
+  - 语义**被补充（两侧同文件）**：`TracePhase` 扩为两写者共用——引擎侧 `boot/begin/queued/waited/surfaced/captured/abort`，入口侧 `requested/rejected/completed/failed`（`side:'provider'` 区分）。入口侧四阶段由 `dsh-compact-provider` 调用本模块**转出**的原语写入（I9 判据单一真源）。
+  - 语义**被修正（事故预防·实测）**：**不得用 `package.json` 子路径导出**对外暴露 trace——消费方副本（`dsh-compact-provider/node_modules/.pnpm/…`）的 `package.json` 由 pnpm 重写，新增 `"./trace"` 导出**不会**同步过去（实测 `match` = False），届时 `ERR_PACKAGE_PATH_NOT_EXPORTED` 会让 provider 装载失败 = **压缩路径整体不可用**。改走主入口 `export { … } from './trace.ts'`（`lib/index.js` 是硬链接，实测与副本哈希一致）。
+  - 首次实测（2026-09-14）：轨迹全阶段落盘 `begin→queued→waited(24157ms)→surfaced(seq 10808)→captured(chars=13166, markerOk=true)`；上下文 504k → 72,524。**五问在一处答齐，无需再写取证脚本。**
 
 - **2026-09-13 首次实践（捕获缺陷）**
   - 语义**被确认**：事务形状、表层替换、`compaction/end.error` 为唯一失败信号

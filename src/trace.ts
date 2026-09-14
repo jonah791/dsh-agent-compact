@@ -23,9 +23,22 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-/** 阶段枚举：一笔记账从 boot（进程级）到 captured / abort（事务级）。 */
+/**
+ * 阶段枚举：一笔记账从 boot（进程级）到 captured / abort（事务级）。
+ *
+ * 两侧共同写同一个文件（2026-09-14 补 provider 侧）：
+ *  - **provider 侧**（`dsh-compact-provider` 的 session_compact 工具）：
+ *    `requested`（工具被调用，带 reason 摘要）→ `rejected`（前置判据不过，未触 seam）
+ *    / `completed`（seam 返回）/ `failed`（seam 抛错）
+ *  - **引擎侧**（AgentCompactEngine）：`begin` → `queued` → `waited` → `surfaced` → `captured`，失败写 `abort`
+ * 两侧用 `side` 字段区分。**一条 `tail` 即可回答「谁发起 / 投给谁 / 断在哪一段 / 结果 / 耗时」。**
+ */
 export type TracePhase =
   | 'boot'
+  | 'requested'
+  | 'rejected'
+  | 'completed'
+  | 'failed'
   | 'begin'
   | 'queued'
   | 'waited'
@@ -40,6 +53,16 @@ export interface TraceEntry {
   phase: TracePhase
   /** 构建标识 `<version>@<lib mtime ms>`——自证「线上跑的是哪个构建」。 */
   build: string
+  /** 写者：`provider`（工具入口侧）/ `engine`（seam 侧）。缺省视为 engine（向后兼容旧行）。 */
+  side?: 'provider' | 'engine'
+  /** provider：`session_compact` 的 reason 摘要（截断，仅决策留痕）。 */
+  reason?: string
+  /** provider：调用方声明的 commandId（如 `alice-self-compact`）。 */
+  commandId?: string
+  /** provider：目标 agent 标识摘要。 */
+  agentId?: string
+  /** provider：本笔是否成功（completed=true / rejected·failed=false）。 */
+  ok?: boolean
   /** 注入前 seq 下界：与 `compaction/end.error` 里的 `after seq N` 同源，可 join 事件流。 */
   seqFloor?: number
   /** 投递目标（`next-turn` / `next-step`）。 */
@@ -82,6 +105,11 @@ export function serializeTraceEntry(entry: TraceEntry): string {
     atMs: entry.atMs,
     phase: entry.phase,
     build: entry.build,
+    ...(entry.side !== undefined ? { side: entry.side } : {}),
+    ...(entry.reason !== undefined ? { reason: entry.reason } : {}),
+    ...(entry.commandId !== undefined ? { commandId: entry.commandId } : {}),
+    ...(entry.agentId !== undefined ? { agentId: entry.agentId } : {}),
+    ...(entry.ok !== undefined ? { ok: entry.ok } : {}),
     ...(entry.seqFloor !== undefined ? { seqFloor: entry.seqFloor } : {}),
     ...(entry.target !== undefined ? { target: entry.target } : {}),
     ...(entry.queueSeq !== undefined ? { queueSeq: entry.queueSeq } : {}),

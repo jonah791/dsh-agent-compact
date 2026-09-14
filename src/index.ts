@@ -58,6 +58,24 @@ export type {
   ResolvedTargetPolicy,
 } from './types.ts'
 
+// 转出侧车轨迹原语（2026-09-14）：让消费方 `dsh-compact-provider` 用**同一份**路径解析/
+// 序列化/追加实现写同一个文件——避免两套判据互相漂移（§5.22 规则 4 判据单一真源）。
+// 走主入口转出而非 package.json 子路径导出：消费方副本的 package.json 由 pnpm 重写，
+// 新增子路径导出**不会**同步过去（实测 False），届时 ERR_PACKAGE_PATH_NOT_EXPORTED
+// 会让 provider 装载失败 = 压缩路径整体不可用。主入口 `./lib/index.js` 是硬链接（改动即时可见）。
+export {
+  BUILD as compactTraceBuild,
+  appendTraceEntry,
+  buildStamp,
+  compactionTracePath,
+  parseTraceEntries,
+  readTraceEntries,
+  resolveHome as compactTraceResolveHome,
+  serializeTraceEntry,
+  trace as compactTrace,
+} from './trace.ts'
+export type { TraceEntry, TracePhase } from './trace.ts'
+
 /** The region transaction's view of this service's dynamically dispatched summarizer. */
 type RegionSummarize = (
   input: SummarizationInput,
