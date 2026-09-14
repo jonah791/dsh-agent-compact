@@ -1,6 +1,7 @@
 # 语义文档：智能体驱动压缩引擎（Agent-Driven Compaction Engine）
 
-> 版本 v0.1.4 · 2026-09-14 · 作者：爱丽丝 · 状态：**已实现**
+> ⚠ **0.1.4 已回退（2026-09-14，主人「回退压缩插件版本」）**：有界重发（`nextInstructionAttempt` / `MAX_INSTRUCTION_ATTEMPTS`）**已从构建中撤下**，代码保留在 git `ed4b4e0`；当前行为 = 0.1.3（单次投递 + 8 秒表层轮询重查）。撤下原因：入口侧（`dsh-compact-provider` 0.3.x 直触）一并回退，先恢复被验证可用的组合（engine 0.1.3 + provider 0.2.0 = turn 71 那次成功压缩）。
+> 版本 v0.1.3（v0.1.4 已回退）· 2026-09-14 · 作者：爱丽丝 · 状态：**已实现**
 > 开发方式：语义文档优先（先写清「是什么/什么关系/怎么裁决」，再让实现逼近，最后用实践回修）
 > 实现落点：`self-plugins/dsh-agent-compact/src/{index,summarizer,region,config,types}.ts`
 
