@@ -37,6 +37,32 @@
 | 转出原语 | `compactTrace` / `appendTraceEntry` / `serializeTraceEntry` / … 供消费方复用（判据单一真源） |
 | 工具面 | 无（服务型插件；`session_compact` 工具原语在同配对的 provider） |
 
+## 快速开始
+
+**1) 装依赖**（引擎与 provider 是**回退对**——同进同退，禁止单侧回退）：
+
+```jsonc
+"dsh-agent-compact": "link:<工作区>/self-plugins/dsh-agent-compact",
+"dsh-compact-provider": "link:<工作区>/self-plugins/dsh-compact-provider"
+```
+
+**2) 挂组合**（引擎行 + provider 行；`auto: false` 保持不动）：
+
+```yaml
+- id: agent-compact
+  name: dsh-agent-compact
+- id: compact-provider
+  name: dsh-compact-provider
+```
+
+**3) 30 秒验证**：调 `session_compact {reason:'…'}` → 该轮只输出 checkpoint（**独占一轮**），任务续做从下一轮开始；随后：
+
+```bash
+tail -3 "$DSH_HOME/compaction-trace.jsonl"
+# 成功：本笔 commandId 的 begin → queued → waited → surfaced → captured
+# 失败：abort 行 + error（此时上下文**不应**变化——没压成就不许动表层）
+```
+
 ## 配置
 
 | 项 | 默认 | 说明 |
