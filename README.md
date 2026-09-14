@@ -1,100 +1,121 @@
 <!--
   DSH 插件生态公约声明（plugin-ecosystem-convention · 组合优先/声明清晰/兼容优先）
-  purpose: Agent-driven compaction for DeepSeek Harness: the agent summarizes its own conversation (KV-cache friendly, no giant replay requests), replacing the official replay-based compaction-basic.
+  purpose: Agent 驱动压缩引擎：由 agent 自己在暖 KV 前缀上总结会话（省整段重放请求），替代官方面向重放的 compaction-basic；与 dsh-compact-provider 配成「想压就压」
   inject: 'llm','tokenMeter','sessions'
-  tools: （无，注入压缩服务）
+  tools: （无——注入 compaction 服务；工具原语在 dsh-compact-provider）
   runtime: host-only
   envDeps: 无（纯逻辑/标准 Node）
-  boundary: 无特殊授权边界
+  boundary: 决定「我上下文」的插件——改动须先写尸体测试（§5.21 规则 4）
   compat: cordis ^4.0.1 / dsh-tools ^0.1.0-rc.6
 -->
-# dsh-agent-compact — DSH 的 Agent 驱动压缩插件
-
+# dsh-agent-compact — Agent 驱动压缩引擎
 
 <p align="center">
-  <a href="https://github.com/jonah791/dsh-agent-compact"><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="version"></a>
+  <a href="https://github.com/jonah791/dsh-agent-compact"><img src="https://img.shields.io/badge/version-0.1.3-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
-  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+  <img src="https://img.shields.io/badge/tests-26%20passed-brightgreen" alt="tests">
 </p>
-**为 DeepSeek Harness (DSH) 打造的 Agent 驱动会话压缩插件。** 与官方后端把整个会话历史重放到独立 LLM 请求里做总结不同，本插件**让 agent 总结自己的对话**——摘要直接从模型已经持有的上下文里产出，命中提供方 KV 缓存，不再构造巨型重放请求。
 
-> 状态：可用原型，已在真实生产会话中完整验证（见[实测证据](#实测证据)）。DSH 为预览版（0.1.0-rc），无兼容承诺。
+**一句话**：把压缩从「官方重放式 summarization」换成「**agent 自己总结自己**」——总结请求在**暖 KV 前缀**上产出，不触发巨型重放请求（实测一次压缩的直接请求成本 ≈1.1M tok 且 99% 缓存命中）。
 
-## 功能特性
+**为什么值得用**：官方 `compaction-basic` 靠服务端重放上下文来总结，上下文越长成本越陡；本引擎让 agent 直接在当前会话里产出 `<compacted-summary>` checkpoint，并**落全程自证轨迹**——压缩失败时，一条 `tail` 就能答完「谁发起 / 断在哪一段 / 为什么失败」。
 
-- **Agent 驱动压缩**：让 agent 总结自己的对话——摘要从模型已持有的上下文产出，命中提供方 KV 缓存，不构造巨型重放请求
-- **事务兼容**：与官方 compaction 协议一致（start/summary/end 封装）
-- **生产验证**：已在真实会话验证（46 万 token 场景）
+> ⚠ **本插件决定「我上下文」的命运**：它是压缩事务的执行者。改它必须先写尸体测试再部署（§5.21 规则 4），并在下一次真实压缩时验收。
 
-## 问题
+## 定位与反定位
 
-官方压缩后端（`@deepseek-ai/dsh-compaction-basic`）通过把完整 surface 重放进一个新 LLM 请求来做总结（`buildSummarizationInput` 无截断）。当会话膨胀到一定程度，这个重放请求会在传输层失败：
+- **管**：压缩事务本身——指令投递（queued→surfaced）、摘要捕获（captured）、表层换血（summary replace）、失败账（abort/error）。
+- **不管**：入口约束与「什么时候压」的决策（`dsh-compact-provider` 管）；上下文提醒与炼化提醒（`dsh-agent-context`/`skill-forge` 管）。
+- **不是**框架自动压缩：`auto: false` 保持关闭；压缩何时发生由 agent 自主决策（工具路径）。
 
-- 真实故障：会话膨胀至 **约 46 万 token 输入**（664 个 surface 节点）→ `compaction/end` 报 `error: "DeepSeek API request to https://api.deepseek.com failed"`
-- 连续 5 次 `/compact` 均以同一 TRANSPORT 错误失败；每次重试都重新构造同一个无上限的重放请求
-- 讽刺的是：官方路径在会话小时能成功，随会话膨胀退化为必然失败——而膨胀恰恰是最需要压缩的时刻
+## 能力
 
-## 方案：让 agent 总结自己的上下文
+| 面 | 内容 |
+|----|------|
+| 注入的服务 | `ctx.compaction`（CompactionEngine 子类）——由 `dsh-compact-provider` 挂载后即为宿主压缩 seam |
+| 轨迹面 | 每笔事务每阶段落一行 `<DSH_HOME>/compaction-trace.jsonl` |
+| 转出原语 | `compactTrace` / `appendTraceEntry` / `serializeTraceEntry` / … 供消费方复用（判据单一真源） |
+| 工具面 | 无（服务型插件；`session_compact` 工具原语在同配对的 provider） |
 
-压缩流程变为：
+## 配置
 
-1. `compaction/start` —— 与官方完全相同的事务封装
-2. 向 agent 的收件箱注入总结指令（next-turn 投递）
-3. agent 基于**当前上下文**直接写出 checkpoint 摘要——提供方的 KV cache 里早已缓存了这些内容
-4. 捕获并校验摘要（`agentSummarize`：非空、比原文小）
-5. `compaction/summary` → surface `replace` → `compaction/end` → flush —— **与官方事务格式字节级兼容**
+| 项 | 默认 | 说明 |
+|----|------|------|
+| `thresholdRatio` | `0.8` | 压力阈值比例（上下文占用触发线） |
+| `retainRatio` | `0.16` | 压缩后保留的原文尾部比例 |
+| `retainTokens` | 路由策略解析 | 保留 token 绝对值 |
+| `summarizationProvider` / `summarizationModel` | 路由策略解析 | 总结用的模型路由 |
+| `maxTokens` | 路由策略解析 | 总结输出上限 |
+| `compactionRetries` / `maxOverflowRetries` | 路由策略解析 | 重试上限 |
+| `modelPolicies` | `[]` | 按精确路由（provider/model）定向覆盖 |
+| `auto` | `false` | **保持关闭**——本插件在「agent 自主决策」形态下运行 |
 
-### 实测证据
+配置 schema 与类型见 `docs/semantic.md` §4.1（provider 复用同一 schema）。
 
-在同一个曾连续失败 5 次的会话上验证（总结轮 turn 24）：
+## 落盘与自证
 
-| 指标 | 数值 |
-|---|---|
-| `inputTokens` | 865 |
-| `cacheReadTokens` | **568,832**（KV 缓存命中——agent 自己的上下文） |
-| `outputTokens` | 1,933 |
-| 结果 | `Compacted 664 history items (~460634 tokens)` |
-| `compaction/end` | 无 `error` 字段 |
+**`<DSH_HOME>/compaction-trace.jsonl`**——一行一阶段，`atMs` 单调。**两个写者共用一个文件**：
 
-## 架构
+| 写者 | `side` | 阶段 |
+|------|--------|------|
+| 引擎（本插件） | 缺省 | `boot` / `begin` / `queued` / `waited` / `surfaced` / `captured` / `abort` |
+| 入口（provider） | `'provider'` | `requested` / `rejected` / `completed` / `failed` |
 
-`src/index.ts` —— `AgentCompactEngine extends CompactionEngine`（来自 `@deepseek-ai/dsh-compaction`）：
+```bash
+tail -6 "$DSH_HOME/compaction-trace.jsonl"
+# ① 跑的是哪个构建 → build = "<版本>@<模块 mtime ms>"
+# ② 谁发起 / 投给谁 → provider 行 commandId:alice-self-compact + agentId + reason 摘要
+# ③ 断在哪一段 → 阶段枚举；断点 = 最后一条非 abort 阶段
+# ④ 结果质量 → captured 行 chars（checkpoint 字符数）+ markerOk（是否含 <compacted-summary>）
+# ⑤ 耗时与预算 → waitedMs vs 120s 等总结轮 / 8s 表层窗口
+```
 
-- `compactNow()` —— **agent 驱动路径**（`/compact` 命令使用）：`agentSummarize` 捕获 agent 自己产出的 checkpoint 消息
-- `compactRegion()` / `compactIfNeeded()` —— 委托官方实现处理区域压缩与自动压缩
+失败免费指纹：`compaction/end.error` 文案**有没有含 `within 8000ms`** 可判它出自哪个构建。观测绝不反噬：落盘失败返回 `false`，压缩主流程照常。
 
-`src/summarizer.ts` —— `agentSummarize`（注入指令、捕获总结轮的 `assistant/message`、校验）与 `summarizeWithLlm`（官方直调兜底）。
+## 生效判据与回退
 
-`src/region.ts` —— 事务层：`compaction/start → compaction/summary → user/message replace → compaction/end → flush`、`compactCheckpointSource`、`toolPairingBalancedBefore/After`、平衡边界检查。
+**生效判据**：
+1. `tail -1 "$DSH_HOME/compaction-trace.jsonl"` 的 `boot` 行 `build` mtime 等于当前 `lib/trace.js` mtime；
+2. 生态级：`plugin_boot_status` 的 `liveNow` 含本插件；
+3. 行为级：成功触发一次压缩（`compaction/start` → `compaction/end` 无 error，上下文 token 实际下降）。
 
-## 安装
+> **重新构建 ≠ 生效**：构建产物 mtime 新只证明「构建过」，进程启动时间晚于产物 mtime 才算「在跑它」。
 
-两种接入方式：
+**回退**：
+- 源码级：`git revert <commit>` → 重新构建 → `preflight_check`（full）→ 重启；
+- 组合级：预设行加 `disabled: true`（压缩服务随之不可用——provider 必须同步停）；
+- 版本级：本插件与 provider 是**回退对**（引擎 0.1.3 ↔ provider 0.2.0），不可只回退一侧。
 
-### A. 原地替换官方后端（已验证）
+## 测试
 
-预设文件引用包名 `@deepseek-ai/dsh-compaction-basic`，而 Loader 从**宿主进程**解析该包名——预设行里写第三方包名会报 `MODULE_NOT_FOUND`。因此已验证的接入方式是把官方包实现原地替换：
+```bash
+npm test        # tsc -p tsconfig.json && node --test "tests/*.test.mjs"
+```
 
-1. 构建：`pnpm run build`（产出 `lib/`）
-2. 备份 `node_modules/@deepseek-ai/dsh-compaction-basic/lib/index.js` → `index.js.bak-official`
-3. 把本包的 `lib/{index,region,summarizer,config,types}.js` 与 `lib/types/` 复制进 `node_modules/@deepseek-ai/dsh-compaction-basic/lib/`
+**26 例离线测试**，含：范围判定（`selectCompactableRange`）、摘要候选选择（`selectSummaryCandidate`，标记块优先 + 拒收碎片）、投递重发判定（`nextInstructionAttempt`）、轨迹序列化/容错解析（坏行跳过）。纯函数 + 薄 IO，无网络、无真实 LLM 依赖。
 
-回滚：把 `index.js.bak-official` 复制回去即可。
+## 设计要点（不可违反）
 
-### B. 作为独立包接入（理想形态，需上游配合）
+- **checkpoint 独占一轮**（§5.21 规则 1）：总结指令要求 agent 当轮**只**产出 `<compacted-summary>`——工具调用会让捕获漂移到后续消息。
+- **三种失败形态**（事件流判据）：
+  ① 表层始终无 `user/message` ⇒ fail-loud 拒收、上下文毫发未缩；
+  ② 失败后指令残留、重启后浮出 ⇒ 产生**孤儿 checkpoint**（无事务可捕获）；
+  ③ 捕获到碎片（远小于 checkpoint 应有大小）⇒ 拒收。
+- **投递语义**：入队 ≠ 投递——`agent/inbox/spliced` 的 inserted/removedCount 是同一投递的两个生命周期事件；判据只能是表层 `user/message`。
+- **KV 友好**：总结请求走暖前缀复用缓存（一次压缩两笔请求 ~1.13M tok，摘要请求是本质、意图请求可省）。
 
-预设名必须能被宿主解析，所以独立包路径需要上游配合：要么官方预设开放可插拔的压缩 provider 槽位，要么 Loader 增加 profile 级解析回退。这正是[上游讨论帖](#)里提出的诉求。
+## 相关文档
 
-## 路线图 / 给上游的建议
+| 文档 | 内容 |
+|------|------|
+| [`docs/semantic.md`](docs/semantic.md) | **权威契约**：事务形状、裁决表、调用点清单、§9 实践修订（含 2026-09-14 五问自证） |
+| [dsh-compact-provider](https://github.com/jonah791/dsh-compact-provider) | 契约消费方（入口/决策留痕）——两份语义文档互相指认 |
+| [alice-digital-life](https://github.com/jonah791/alice-digital-life) | 生态中心 |
 
-- 短期：官方 `buildSummarizationInput` 应截断或流式化，而不是构造无上限的重放请求（TRANSPORT 失败的根因）
-- 中期：把压缩总结器做成可插拔 provider，使 agent 驱动总结可从预设中选择——本包即参考实现
-- 本仓库已按 CONTRIBUTING.md 建议挂 `dsh-plugin` topic 发布
+## License
 
-## 相关
+MIT © jonah791
 
-- [我的数字生命爱丽丝 — 插件生态中心（架构总览）](https://github.com/jonah791/alice-digital-life)
+---
 
-## 许可
-
-MIT
+本插件属于爱丽丝 DSH 自研插件生态（见 [alice-digital-life](https://github.com/jonah791/alice-digital-life)）。
