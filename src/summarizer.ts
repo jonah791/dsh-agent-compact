@@ -10,6 +10,13 @@ import type {
   ContentBlock, FinishReason, GenerateOptions, Message, TokenUsage, ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { trace } from './trace.ts'
+
+/** 会话 id 前缀（多会话并存时区分轨迹；结构存取以避开 branded 类型）。 */
+function sessionTag(session: unknown): string | undefined {
+  const id = (session as { id?: unknown } | null)?.id
+  return typeof id === 'string' && id !== '' ? id.slice(0, 8) : undefined
+}
 
 interface SummaryConfig {
   readonly summarizationProvider: string
@@ -484,6 +491,11 @@ export async function agentSummarize(
   // Snapshot before the injection: everything appended from here on belongs to
   // the summarizing turn and must not be shadowed.
   const seqFloor = sessionView.seq
+  const sid = sessionTag(session)
+  const startedAtMs = Date.now()
+  // 轨迹自证（2026-09-14 可维护性）：本插件的过程只进 logger，而宿主 logger 不落盘——
+  // 于是「谁发 / 投给谁 / 落地没 / 断在哪段」只能外部反解事件流。这里把关键阶段落成侧车 JSONL。
+  trace({ phase: 'begin', seqFloor, session: sid })
 
   const onAbort = (): void => {
     try {
@@ -505,10 +517,12 @@ export async function agentSummarize(
       'next-turn',
       true,
     )
+    trace({ phase: 'queued', seqFloor, session: sid, target: 'next-turn' })
     // busy 会话修复：agent.whenIdle() 等「agent 完全无活动」——对话中的 agent 每轮都在动，
     // 永不 resolve → 压缩挂起。改为等「总结轮 turn 完成」：指令后第一个新 turn 出现
     // assistant 消息后，一旦出现更新的 turn 即视为总结轮结束。
     await waitSummaryTurn(sessionView, seqFloor, 120000)
+    trace({ phase: 'waited', seqFloor, session: sid, waitedMs: Date.now() - startedAtMs })
   } finally {
     if (signal !== undefined) signal.removeEventListener('abort', onAbort)
   }
@@ -527,12 +541,16 @@ export async function agentSummarize(
     surface = instructionSurfaced(sessionView, seqFloor)
   }
   if (!surface.surfaced) {
-    throw new Error(
-      'agent summarization instruction never reached the model-visible surface after seq '
+    const reason = 'agent summarization instruction never reached the model-visible surface after seq '
       + String(seqFloor) + ' within ' + String(SURFACE_WAIT_MS) + 'ms（入队成功但模型未看见）'
-      + '——拒绝捕获；同类事故见 compaction 9ce76cec',
-    )
+      + '——拒绝捕获；同类事故见 compaction 9ce76cec'
+    trace({ phase: 'abort', seqFloor, session: sid, error: reason, waitedMs: Date.now() - startedAtMs })
+    throw new Error(reason)
   }
+  trace({
+    phase: 'surfaced', seqFloor, session: sid, surfaceSeqs: surface.seqs,
+    waitedMs: Date.now() - startedAtMs,
+  })
   ctx.logger.info('总结指令已进入表层：seq=' + surface.seqs.join(','))
 
   // 捕获总结轮（targetTurn）的 assistant 消息——**按判据选**，不是「最后一个」：
@@ -570,9 +588,14 @@ export async function agentSummarize(
   // 「捕获到了别的东西」，此时 fail loud 让压缩失败可见（compaction/end.error），而不是静默损坏历史。
   const chosenChars = candidates[picked.index]!.text.trim().length
   if (chosenChars < MIN_PLAUSIBLE_SUMMARY_CHARS) {
-    throw new Error('agent summarization produced an implausibly small summary ('
+    const reason = 'agent summarization produced an implausibly small summary ('
       + String(chosenChars) + ' chars < ' + String(MIN_PLAUSIBLE_SUMMARY_CHARS)
-      + ')：疑似捕获漂移，拒绝以其替换会话历史')
+      + ')：疑似捕获漂移，拒绝以其替换会话历史'
+    trace({
+      phase: 'abort', seqFloor, session: sid, chars: chosenChars, error: reason,
+      waitedMs: Date.now() - startedAtMs,
+    })
+    throw new Error(reason)
   }
   const summary = summaryText(message.content)
   if (!summary.some((block) => block.text.trim().length > 0)) {
@@ -582,6 +605,11 @@ export async function agentSummarize(
     provider: agent.options.provider ?? '',
     model: agent.options.model ?? '',
   }
+  trace({
+    phase: 'captured', seqFloor, session: sid, chars: chosenChars,
+    markerOk: candidates[picked.index]!.text.includes(SUMMARY_OPEN_TAG),
+    waitedMs: Date.now() - startedAtMs,
+  })
   return {
     summary,
     rawOutput: message.content,

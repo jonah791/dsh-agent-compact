@@ -41,6 +41,7 @@ import {
   selectCompactableRange,
 } from './region.ts'
 import { agentSummarize, summarizeWithLlm } from './summarizer.ts'
+import { trace } from './trace.ts'
 import type { SummarizationInput, SummaryResult } from './summarizer.ts'
 import type {
   BasicCompactionConfig,
@@ -427,5 +428,13 @@ export class AgentCompactEngine extends CompactionEngine {
     })
   }
 }
+
+// 构建自报（可维护性，2026-09-14）：进程加载即落一行轨迹，声明「我是哪个构建 +
+// 我贡献什么入口 + 我依赖什么服务」。排障第一步历来是「线上跑的是哪个构建」——
+// 以前要手工比 `lib/*.js` mtime 与 web 进程启动时间，现在一行 `--live` 就能答。
+trace({
+  phase: 'boot',
+  note: 'inject=llm,tokenMeter,sessions;tools=session_compact;path=agent-driven(manual)',
+})
 
 export default AgentCompactEngine
