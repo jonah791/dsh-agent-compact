@@ -29,6 +29,17 @@ const SUMMARY_CLOSE_TAG = '</compacted-summary>'
 const MIN_PLAUSIBLE_SUMMARY_CHARS = 200
 
 /**
+ * 「指令进入表层」的等待上限与轮询间隔（2026-09-14 实测给定）。
+ *
+ * 为什么需要等待：表层的落地时机**不固定**——健康样本里表层(5972)先于摘要(5973)，
+ * 而失败样本里摘要在前、表层出现在**下一个 turn 边界**(7951)。总结轮一结束就判定
+ * "没进表层"会误杀正常压缩（0.1.2 首日实测：一次真实压缩被自己的闸门拦下）。
+ * 8 秒上限是"够短、不至于把坏样本拖太久"与"够长、覆盖一个 turn 边界"的折中。
+ */
+const SURFACE_WAIT_MS = 8000
+const SURFACE_POLL_MS = 500
+
+/**
  * The summarization directive, delivered as the FINAL user message after the
  * replayed conversation rather than as a distinct summarizer system prompt.
  * Keeping the conversation's own system prompt, tools, and message prefix in
@@ -383,6 +394,40 @@ export interface InstructionSurfaceEvidence {
 }
 
 /**
+ * 从会话事件里抽出全部文本块（**形状宽容**）。
+ *
+ * 为什么必须宽容（2026-09-14 事故）：`user/message` 在事件流里有两种载体形状——
+ *   ① `data.content: [{type:'text', text}]` ← **实测的真实形状**（inbox 排空后落到表层就是它）
+ *   ② `data.message.content: [...]` ← 另一条链路
+ * 初版只读 ② ⇒ 对 ① 恒返回 false ⇒ 闸门 100% 假拒绝：0.1.2 上线后第一次真实压缩直接被拦
+ * （compaction/end seq=7952，上下文卡在 512k 未缩小）。
+ * 教训：**形状要按实测取证，不能按记忆里的"另一种写法"**。
+ * @param data - 事件 `data` 字段
+ * @returns 全部文本块拼接
+ */
+export function textOfEventData(data: unknown): string {
+  const parts: string[] = []
+  const push = (value: unknown): void => {
+    if (!Array.isArray(value)) return
+    for (const block of value) {
+      const candidate = block as { text?: unknown } | null
+      if (candidate !== null && typeof candidate === 'object' && typeof candidate.text === 'string') {
+        parts.push(candidate.text)
+      }
+    }
+  }
+  const record = data as { content?: unknown; message?: { content?: unknown }; inserted?: unknown } | null
+  if (record !== null && typeof record === 'object') {
+    push(record.content)                                 // ① 实测形状
+    push(record.message?.content)                        // ② 兼容形状
+    if (Array.isArray(record.inserted)) {                // ③ 入队事件的 inserted[].content
+      for (const item of record.inserted) push((item as { content?: unknown } | null)?.content)
+    }
+  }
+  return parts.join('\n')
+}
+
+/**
  * 判据：总结指令是否**真的进入过模型可见表层**。
  *
  * 为什么需要这条前置条件（2026-09-13 事件流取证）：投递管线里「入队」
@@ -390,8 +435,11 @@ export interface InstructionSurfaceEvidence {
  * 投递的两个生命周期事件**——把它们当两次投递会误判成「双投递」（旧版取证脚本正是如此，
  * 已证伪）。真正决定成败的是**表层**：只有当指令出现在 `user/message` 里，模型才可能产出
  * checkpoint。turn 29（compaction 9ce76cec）实测 queued=1 / surfaced=0：指令入队却没进表层，
- * 120s 超时后捕获到了别的工作文本（117 字符，由长度下限拒收）。长度下限只挡碎片，本判据挡的是
- * **长工作文本**被当成 checkpoint 换掉历史的那种损坏。
+ * 120s 超时后捕获到了别的工作文本（117 字符，由长度下限拒收）。
+ *
+ * **顺序不固定（2026-09-14 实测）**：健康样本里表层(5972)在摘要(5973)之前；失败样本里摘要
+ * (7945)在表层(7951)之前（表层出现在**下一个 turn 边界**）⇒ 调用方必须允许短暂重查，
+ * 不得假定"总结轮结束时表层一定已存在"（见 `agentSummarize` 里的等待重查）。
  *
  * @param view - 会话事件视图（当前 seq + 按序取事件）
  * @param seqFloor - 注入前的 seq 下界：只有其后的表层事件才属于总结轮
@@ -409,15 +457,7 @@ export function instructionSurfaced(
   for (let index = seqFloor; index < view.seq; index += 1) {
     const event = view.eventAt(index)
     if (event === undefined || event.type !== 'user/message') continue
-    const content = (event.data as { message?: { content?: unknown } } | undefined)?.message?.content
-    if (!Array.isArray(content)) continue
-    for (const block of content) {
-      const candidate = block as { type?: string; text?: unknown }
-      if (candidate.type === 'text' && typeof candidate.text === 'string' && candidate.text.includes(needle)) {
-        seqs.push(index)
-        break
-      }
-    }
+    if (textOfEventData(event.data).includes(needle)) seqs.push(index)
   }
   return { surfaced: seqs.length > 0, seqs }
 }
@@ -477,11 +517,20 @@ export async function agentSummarize(
   // 捕获前置条件（2026-09-13）：指令必须真的进过模型可见表层——**入队 ≠ 模型看见**。
   // 拿不到这条证据时宁可压不成（fail loud，compaction/end.error 可见），也不拿可能是
   // 工作前言的文本去替换会话历史。
-  const surface = instructionSurfaced(sessionView, seqFloor)
+  // 2026-09-14 补两处（事故复盘）：① 事件形状宽容（真实形状是 data.content，初版只读
+  // data.message.content ⇒ 恒 false ⇒ 100% 假拒绝）② 表层落地时机不固定（可能在下个 turn
+  // 边界）⇒ 先等一小段再重查，别在总结轮结束的瞬间就判定"没进表层"。
+  let surface = instructionSurfaced(sessionView, seqFloor)
+  for (let waited = 0; !surface.surfaced && waited < SURFACE_WAIT_MS; waited += SURFACE_POLL_MS) {
+    // 就地等待：`sleep` helper 是 waitSummaryTurn 的局部函数，这里不越作用域取它
+    await new Promise<void>((resolve) => setTimeout(resolve, SURFACE_POLL_MS))
+    surface = instructionSurfaced(sessionView, seqFloor)
+  }
   if (!surface.surfaced) {
     throw new Error(
       'agent summarization instruction never reached the model-visible surface after seq '
-      + String(seqFloor) + '（入队成功但模型未看见）——拒绝捕获；同类事故见 compaction 9ce76cec',
+      + String(seqFloor) + ' within ' + String(SURFACE_WAIT_MS) + 'ms（入队成功但模型未看见）'
+      + '——拒绝捕获；同类事故见 compaction 9ce76cec',
     )
   }
   ctx.logger.info('总结指令已进入表层：seq=' + surface.seqs.join(','))

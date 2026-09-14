@@ -21,8 +21,20 @@ function viewOf(events) {
   }
 }
 
-/** 表层 user/message（模型真正看到的）。 */
+/**
+ * 表层 user/message —— **实测形状**：`data.content: [{type:'text', text}]`。
+ *
+ * 这个 helper 曾经写成 `data.message.content`（我按记忆里的另一种写法写的），
+ * 于是 `instructionSurfaced` 对真实事件恒返回 false → 0.1.2 上线后**第一次真实压缩
+ * 被自己的闸门拦下**（compaction/end seq=7952，上下文卡在 512k）。
+ * 现在两个形状都覆盖（见下面「形状覆盖」用例）。
+ */
 function surfacedMessage(text) {
+  return { type: 'user/message', data: { content: [{ type: 'text', text }] } }
+}
+
+/** 另一种载体形状：`data.message.content`（兼容用例，不是实测主形状）。 */
+function surfacedMessageNested(text) {
   return { type: 'user/message', data: { message: { role: 'user', content: [{ type: 'text', text }] } } }
 }
 
@@ -105,5 +117,30 @@ describe('instructionSurfaced：指令是否真的进了模型可见表层', () 
     const result = instructionSurfaced(view, 0)
     assert.equal(result.surfaced, true)
     assert.deepEqual(result.seqs, [0, 2])
+  })
+
+  test('形状覆盖：两种载体形状都要认（data.content 与 data.message.content）', () => {
+    const flat = instructionSurfaced(viewOf([surfacedMessage(AGENT_COMPACTION_INSTRUCTION)]), 0)
+    assert.equal(flat.surfaced, true, 'data.content 是实测主形状，必须被认出来')
+    const nested = instructionSurfaced(viewOf([surfacedMessageNested(AGENT_COMPACTION_INSTRUCTION)]), 0)
+    assert.equal(nested.surfaced, true, '另一种载体形状也要兼容')
+  })
+
+  test('回归样本（2026-09-14 事故）：摘要先于表层、表层在下个 turn 边界出现 → 仍须判 true', () => {
+    // 真实序列：compaction/start(7940) → 入队(7941) → 摘要 assistant(7945) → turn/end(7947)
+    // → turn/start(7948) → 排空(7949) → 表层 user/message(7951)
+    const view = viewOf([
+      { type: 'compaction/start', data: {} },
+      queuedInstruction(),
+      { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '## Primary Request and Intent' }] } } },
+      { type: 'turn/end', data: {} },
+      { type: 'turn/start', data: {} },
+      drainedInbox(),
+      surfacedMessage(AGENT_COMPACTION_INSTRUCTION),
+      { type: 'compaction/summary', data: {} },
+    ])
+    const result = instructionSurfaced(view, 1)
+    assert.equal(result.surfaced, true, '表层晚于摘要出现也必须算已投递（顺序不固定）')
+    assert.deepEqual(result.seqs, [6])
   })
 })
