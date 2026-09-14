@@ -462,51 +462,6 @@ export function instructionSurfaced(
   return { surfaced: seqs.length > 0, seqs }
 }
 
-/** 指令投递的最大尝试次数（含首次）。有界——重发也压不成时 fail loud，不无限耗。 */
-export const MAX_INSTRUCTION_ATTEMPTS = 2
-
-/** 一次投递尝试之后该做什么（纯函数，可单测）。 */
-export type InstructionAttemptAction = 'accept' | 'resend' | 'fail'
-
-/**
- * 指令投递失败后的动作裁决。
- *
- * 判据不变（表层出现 `user/message` 才算模型看见），但**「没看见」不应直接判死**：
- * 2026-09-14 二次事故（compaction `fca6c9bc` / turn 77）实测——指令入队后被某一步消费
- * （`agent/inbox/spliced` drain），而该步的请求随即 `assistant/attempt` + `llm/retry`
- * （provider 重试）：重建请求时指令蒸发，表层始终没有 `user/message` → 事务失败、
- * **上下文毫发未缩，且冷却把下一次机会挡在 10 分钟之外**。重发一次即可自愈。
- * @param input - 本次尝试的观测值
- * @returns 接受（已进表层）/ 重发（还没到上限）/ 失败（到上限，交给调用方 fail loud）
- */
-export function nextInstructionAttempt(input: {
-  readonly attempt: number
-  readonly surfaced: boolean
-  readonly maxAttempts: number
-}): InstructionAttemptAction {
-  if (input.surfaced) return 'accept'
-  return input.attempt >= input.maxAttempts ? 'fail' : 'resend'
-}
-
-/**
- * 等总结指令进入表层（有界轮询：表层落地时机不固定，可能在下个 turn 边界）。
- * @param view - 会话事件视图（当前 seq + 按序取事件）
- * @param seqFloor - 本次尝试的 seq 下界
- * @returns 表层证据
- */
-async function waitForInstructionSurface(
-  view: { seq: number; eventAt(seq: number): { type?: string; data?: unknown } | undefined },
-  seqFloor: number,
-): Promise<InstructionSurfaceEvidence> {
-  let surface = instructionSurfaced(view, seqFloor)
-  for (let waited = 0; !surface.surfaced && waited < SURFACE_WAIT_MS; waited += SURFACE_POLL_MS) {
-    // 就地等待：`sleep` helper 是 waitSummaryTurn 的局部函数，这里不越作用域取它
-    await new Promise<void>((resolve) => setTimeout(resolve, SURFACE_POLL_MS))
-    surface = instructionSurfaced(view, seqFloor)
-  }
-  return surface
-}
-
 /**
  * Deliver the compaction instruction to the agent and capture its summarizing
  * reply as the checkpoint summary.
@@ -528,8 +483,7 @@ export async function agentSummarize(
   }
   // Snapshot before the injection: everything appended from here on belongs to
   // the summarizing turn and must not be shadowed.
-  // 本次尝试的 seq 下界（每次尝试都重取：重发后新一轮的 checkpoint 必须落在自己的下界之后）
-  let seqFloor = sessionView.seq
+  const seqFloor = sessionView.seq
 
   const onAbort = (): void => {
     try {
@@ -542,53 +496,41 @@ export async function agentSummarize(
     if (signal.aborted) onAbort()
     else signal.addEventListener('abort', onAbort, { once: true })
   }
-  // 指令投递 + 表层取证：**有界重发**（2026-09-14 二次事故：指令被「消费它的那一步」的请求吃掉，
-  // 该请求随即 provider 重试 → 重建请求时指令蒸发 → 表层永远没有 user/message → 事务失败且上下文
-  // 毫发未缩。判据不变，但「没看见」要重发一次而不是直接判死——见 nextInstructionAttempt）。
-  let surface: InstructionSurfaceEvidence = { surfaced: false, seqs: [] }
   try {
-    for (let attempt = 1; attempt <= MAX_INSTRUCTION_ATTEMPTS; attempt += 1) {
-      seqFloor = sessionView.seq
-      agent.send(
-        createUserMessage({
-          content: [{ type: 'text', text: AGENT_COMPACTION_INSTRUCTION }],
-          source: { kind: 'plugin', plugin: 'dsh-agent-compact' },
-        }),
-        'next-turn',
-        true,
-      )
-      // busy 会话修复：agent.whenIdle() 等「agent 完全无活动」——对话中的 agent 每轮都在动，
-      // 永不 resolve → 压缩挂起。改为等「总结轮 turn 完成」：指令后第一个新 turn 出现
-      // assistant 消息后，一旦出现更新的 turn 即视为总结轮结束。
-      await waitSummaryTurn(sessionView, seqFloor, 120000)
-      if (signal?.aborted) throw new LlmError('agent summarization was cancelled', 'ABORTED')
-      // 捕获前置条件（2026-09-13）：指令必须真的进过模型可见表层——**入队 ≠ 模型看见**。
-      // 拿不到这条证据时宁可压不成（fail loud，compaction/end.error 可见），也不拿可能是
-      // 工作前言的文本去替换会话历史。
-      // 2026-09-14 补两处（事故复盘）：① 事件形状宽容（真实形状是 data.content，初版只读
-      // data.message.content ⇒ 恒 false ⇒ 100% 假拒绝）② 表层落地时机不固定（可能在下个 turn
-      // 边界）⇒ 先等一小段再重查，别在总结轮结束的瞬间就判定"没进表层"。
-      surface = await waitForInstructionSurface(sessionView, seqFloor)
-      const action = nextInstructionAttempt({
-        attempt,
-        surfaced: surface.surfaced,
-        maxAttempts: MAX_INSTRUCTION_ATTEMPTS,
-      })
-      if (action !== 'resend') break
-      ctx.logger.warn(
-        '总结指令第 ' + String(attempt) + ' 次未进表层（入队后被消费、请求重建时蒸发）——重发一次',
-      )
-    }
+    agent.send(
+      createUserMessage({
+        content: [{ type: 'text', text: AGENT_COMPACTION_INSTRUCTION }],
+        source: { kind: 'plugin', plugin: 'dsh-agent-compact' },
+      }),
+      'next-turn',
+      true,
+    )
+    // busy 会话修复：agent.whenIdle() 等「agent 完全无活动」——对话中的 agent 每轮都在动，
+    // 永不 resolve → 压缩挂起。改为等「总结轮 turn 完成」：指令后第一个新 turn 出现
+    // assistant 消息后，一旦出现更新的 turn 即视为总结轮结束。
+    await waitSummaryTurn(sessionView, seqFloor, 120000)
   } finally {
     if (signal !== undefined) signal.removeEventListener('abort', onAbort)
   }
   if (signal?.aborted) throw new LlmError('agent summarization was cancelled', 'ABORTED')
+
+  // 捕获前置条件（2026-09-13）：指令必须真的进过模型可见表层——**入队 ≠ 模型看见**。
+  // 拿不到这条证据时宁可压不成（fail loud，compaction/end.error 可见），也不拿可能是
+  // 工作前言的文本去替换会话历史。
+  // 2026-09-14 补两处（事故复盘）：① 事件形状宽容（真实形状是 data.content，初版只读
+  // data.message.content ⇒ 恒 false ⇒ 100% 假拒绝）② 表层落地时机不固定（可能在下个 turn
+  // 边界）⇒ 先等一小段再重查，别在总结轮结束的瞬间就判定"没进表层"。
+  let surface = instructionSurfaced(sessionView, seqFloor)
+  for (let waited = 0; !surface.surfaced && waited < SURFACE_WAIT_MS; waited += SURFACE_POLL_MS) {
+    // 就地等待：`sleep` helper 是 waitSummaryTurn 的局部函数，这里不越作用域取它
+    await new Promise<void>((resolve) => setTimeout(resolve, SURFACE_POLL_MS))
+    surface = instructionSurfaced(sessionView, seqFloor)
+  }
   if (!surface.surfaced) {
     throw new Error(
       'agent summarization instruction never reached the model-visible surface after seq '
-      + String(seqFloor) + ' within ' + String(SURFACE_WAIT_MS) + 'ms × '
-      + String(MAX_INSTRUCTION_ATTEMPTS) + ' attempts（入队成功但模型未看见）'
-      + '——拒绝捕获；同类事故见 compaction fca6c9bc / 9ce76cec',
+      + String(seqFloor) + ' within ' + String(SURFACE_WAIT_MS) + 'ms（入队成功但模型未看见）'
+      + '——拒绝捕获；同类事故见 compaction 9ce76cec',
     )
   }
   ctx.logger.info('总结指令已进入表层：seq=' + surface.seqs.join(','))
