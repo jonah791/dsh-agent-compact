@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-compact",
   "version": "0.1.3",
-  "description": "Agent-driven compaction for DeepSeek Harness: the agent summarizes its own conversation (KV-cache friendly, no giant replay requests), replacing the official replay-based compaction-basic.",
+  "description": "Agent 驱动压缩引擎：由 agent 自己在暖 KV 前缀上总结会话（省整段重放请求），替代官方面向重放的 compaction-basic；与 dsh-compact-provider 配成「想压就压」。",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
