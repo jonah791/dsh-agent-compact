@@ -162,6 +162,8 @@
   - **明确不做**：把 Service 类形态（`static inject`）重构为函数插件形态。该形态是 cordis 合法写法且本插件用法与声明一致（`static inject = ['llm','tokenMeter','sessions']`）；而本插件是 `dsh-compact-provider` 的 **live 依赖**（`file:../dsh-agent-compact`），**无判据的重构只有回归风险**。
   - 教训：**审计器报「无命中」时不要顺手加"归一化"判断**——判断项必须落到「哪一行、依据什么」才算数，否则会把风格差异说成缺陷。
 
+- **2026-09-22 行尾归一（D3 复核：判为 mtime 抖动，非语义漂移）**：本仓存量的 CRLF 工作区文件被强制重检出为 LF（`git add --renormalize .` 归一索引 + `rm && git checkout` 重写工作区），**触碰了 impl 落点的 mtime** ⇒ `semantic_check` 报 D3「实现比文档新」。实现内容一字未改（`git diff HEAD --stat` 为空即证）——触发量是行尾，不是语义。⇒ 归入 D3 的 mtime 抖动型误报，已在 `t-c54b41c6` / `t-9a4a045e` 记录。
+
 ## 10 · 未决问题
 
 - **U1** 重发上限是否该按「指令文本不变 + 表层层级」再收紧（当前 2 次，尚无真实重发样本）
