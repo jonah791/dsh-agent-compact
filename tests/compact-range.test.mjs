@@ -64,7 +64,7 @@ function sessionWithSystemHead() {
   s.append('system/message', {
     turn: 1,
     step: 1,
-    message: createSystemMessage('YOU ARE A TEST SYSTEM PROMPT', 'test-plugin'),
+    message: createSystemMessage('YOU ARE A TEST SYSTEM PROMPT'),
   }, { surfaceOp: 'append' })
   for (let i = 0; i < 6; i += 1) {
     s.append('user/message', createUserMessage({
@@ -99,7 +99,7 @@ test('尸体测试：把区间起点放在 system node 0 上，真实 harness �
 
   assert.throws(
     () => s.append('user/message', createUserMessage({
-      content: [{ type: 'text', text: 'checkpoint' }], source: { kind: 'plugin', plugin: 'test' },
+      content: [{ type: 'text', text: 'checkpoint' }], source: { kind: 'test' },
     }), {
       surfaceOp: { op: 'replace', startSeq: node0, endSeq: last },
       sourceEventSeqs: s.surface.nodes.slice(),
@@ -145,7 +145,7 @@ test('证据有效性：区间整体可被真实 harness 接受（替换成功�
   )
   const before = s.surface.nodes.length
   const replacement = s.append('user/message', createUserMessage({
-    content: [{ type: 'text', text: 'checkpoint' }], source: { kind: 'plugin', plugin: 'test' },
+    content: [{ type: 'text', text: 'checkpoint' }], source: { kind: 'test' },
   }), {
     surfaceOp: { op: 'replace', startSeq: range.start, endSeq: range.end },
     sourceEventSeqs: shadowed,
