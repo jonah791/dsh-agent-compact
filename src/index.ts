@@ -41,7 +41,8 @@ import {
   selectCompactableRange,
 } from './region.ts'
 import { agentSummarize, summarizeWithLlm } from './summarizer.ts'
-import { trace } from './trace.ts'
+import { sessionTagOf, trace } from './trace.ts'
+import type { TraceEntry, TracePhase } from './trace.ts'
 import type { SummarizationInput, SummaryResult } from './summarizer.ts'
 import type {
   BasicCompactionConfig,
@@ -82,6 +83,54 @@ type RegionSummarize = (
   agent: Agent,
   signal?: AbortSignal,
 ) => Promise<SummaryResult>
+
+/**
+ * 自动压缩路径的阶段轨迹（2026-09-23 补 · §5.22 规则 1）。
+ *
+ * **缺口**：侧车轨迹原先只覆盖**手动路径**（`summarizer.ts` 的 agentSummarize 记
+ * begin/queued/waited/surfaced/captured/abort，provider 侧记 requested/completed/failed），
+ * 而自动路径（步间压力 / 请求溢出恢复 / 忙会话手动）**一条都不记**——三处失败处理
+ * 只写 `ctx.logger.warn`，而宿主 logger **不落盘**。
+ * 代价实测：2026-09-23 修 12 个被写坏的会话时，无法回答「哪条路径写的 / 哪个构建写的 /
+ * 断在哪一阶段」，只能事后反解事件流。
+ *
+ * 为什么集中在这里：调用点才知道**触发路径**（trigger），也让 `region.ts` 保持纯净
+ * （它只负责事务语义，不负责观测）。
+ * @param phase - 阶段（`begin` 起、`captured` 成、`abort` 败）。
+ * @param trigger - 触发路径：`step-pressure` / `context-overflow` / `manual-idle` / `manual-busy`。
+ * @param agent - 被压缩的 agent（提供 id 与会话前缀）。
+ * @param extra - 附加字段（error / waitedMs / chars 等）。
+ */
+function traceAutomatic(
+  phase: TracePhase,
+  trigger: string,
+  agent: Agent,
+  extra: Omit<Partial<TraceEntry>, 'trigger'> = {},
+): void {
+  trace({
+    phase,
+    trigger,
+    agentId: agent.id,
+    session: sessionTagOf(agent.session),
+    ...extra,
+  })
+}
+
+/** 错误链文本（轨迹里只留一行；非 Error 也如实转字符串）。 */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * checkpoint 字符数（轨迹字段）：对结果做**宽松形状断言**——拿不到就不记。
+ * 轨迹是观测，不得因字段形状猜错而破坏压缩主流程（§5.24：观测绝不反噬主流程）。
+ * @param result - 压缩结果（可能为 null：未触发）。
+ * @returns 字符数；形状不符时 `undefined`。
+ */
+function summaryCharsOf(result: CompactionResult | null): number | undefined {
+  const summary = (result as { summary?: unknown } | null)?.summary
+  return typeof summary === 'string' ? summary.length : undefined
+}
 
 /** Resolve the exact provider/model durably routed for the latest request. */
 function routedTarget(
@@ -324,17 +373,34 @@ export class AgentCompactEngine extends CompactionEngine {
     if (owner === null) {
       // 空闲会话：同步执行，命令等待真实结果。
       return run().then(
-        (result) => { this.active.delete(agent.id); return result },
-        (error) => { this.active.delete(agent.id); throw error },
+        (result) => {
+          this.active.delete(agent.id)
+          traceAutomatic('captured', 'manual-idle', agent, { chars: summaryCharsOf(result) })
+          return result
+        },
+        (error) => {
+          this.active.delete(agent.id)
+          traceAutomatic('abort', 'manual-idle', agent, { error: errorText(error) })
+          throw error
+        },
       )
     }
     // 会话正忙：想压就压——总结指令排入 inbox，agent 当前思维结束后的下一次
     // 输出即总结，产生后即替换；命令立即确认，不阻塞正在进行的思考。
     void run().then(
-      () => this.active.delete(agent.id),
+      (result) => {
+        this.active.delete(agent.id)
+        traceAutomatic('captured', 'manual-busy', agent, {
+          chars: summaryCharsOf(result),
+          note: 'fire-and-forget 手动压缩完成（属主回合＝提交那一刻开着的回合）',
+        })
+      },
       (error) => {
         this.active.delete(agent.id)
-        const message = error instanceof Error ? error.message : String(error)
+        const message = errorText(error)
+        // 失败必须落盘：补丁后「start 之前失败」不再留未闭合 start（读侧要求），
+        // 若这里也只进 logger，则这一笔在事后**完全不可见**（2026-09-23 缺口）。
+        traceAutomatic('abort', 'manual-busy', agent, { error: message })
         this.ctx.logger.warn(
           `queued manual compaction failed: ${message}; the conversation is unchanged`,
         )
@@ -380,13 +446,21 @@ export class AgentCompactEngine extends CompactionEngine {
       if (!signal.aborted) {
         try {
           const result = await this.compactIfNeeded(agent, 'pressure', signal)
-          if (result !== null) logResult(result, 'step pressure')
+          if (result !== null) {
+            logResult(result, 'step pressure')
+            traceAutomatic('captured', 'step-pressure', agent, { chars: summaryCharsOf(result) })
+          }
         } catch (error: unknown) {
+          const message = errorText(error)
           if (error instanceof TargetPressureConfigError) {
+            // 配置类错误按 targetKey 去重（每个 target 只喊一次），轨迹同样只落一次
             if (this.warnedPressureConfigTargets.has(error.targetKey)) return next()
             this.warnedPressureConfigTargets.add(error.targetKey)
           }
-          const message = error instanceof Error ? error.message : String(error)
+          traceAutomatic('abort', 'step-pressure', agent, {
+            error: message,
+            ...(error instanceof TargetPressureConfigError ? { note: 'target-config' } : {}),
+          })
           ctx.logger.warn(`step compaction failed: ${message}; continuing the turn`)
         }
       }
@@ -422,7 +496,13 @@ export class AgentCompactEngine extends CompactionEngine {
       try {
         result = await this.compactIfNeeded(agent, 'context-overflow', signal)
       } catch (recoveryError: unknown) {
-        const message = recoveryError instanceof Error ? recoveryError.message : String(recoveryError)
+        const message = errorText(recoveryError)
+        traceAutomatic('abort', 'context-overflow', agent, {
+          error: message,
+          ...(!signal.aborted && agent.session.surface.replaceGeneration > generation
+            ? { note: 'durable-surface-progress' }
+            : {}),
+        })
         if (!signal.aborted && agent.session.surface.replaceGeneration > generation) {
           ctx.logger.warn(
             `context-overflow compaction failed after durable surface progress: ${message}; `
@@ -440,7 +520,10 @@ export class AgentCompactEngine extends CompactionEngine {
       }
       if (signal.aborted
         || agent.session.surface.replaceGeneration <= generation) return next()
-      if (result !== null) logResult(result, 'context overflow recovery')
+      if (result !== null) {
+        logResult(result, 'context overflow recovery')
+        traceAutomatic('captured', 'context-overflow', agent, { chars: summaryCharsOf(result) })
+      }
       this.overflowRetries.set(agent, retries + 1)
       return { kind: 'retry' }
     })

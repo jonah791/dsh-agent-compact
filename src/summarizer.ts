@@ -10,13 +10,17 @@ import type {
   ContentBlock, FinishReason, GenerateOptions, Message, TokenUsage, ToolSchema,
 } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { trace } from './trace.ts'
+import { trace, sessionTagOf } from './trace.ts'
 
-/** 会话 id 前缀（多会话并存时区分轨迹；结构存取以避开 branded 类型）。 */
-function sessionTag(session: unknown): string | undefined {
-  const id = (session as { id?: unknown } | null)?.id
-  return typeof id === 'string' && id !== '' ? id.slice(0, 8) : undefined
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-agent-compact': { kind: 'dsh-agent-compact' }
+  }
 }
+
+// 会话 id 前缀（多会话并存时区分轨迹）。实现已提到证据层 `trace.ts`（2026-09-23）：
+// 自动路径也要记同一字段，若各自留一份复制品，漂移后两处的 `session` 就没法 join。
+const sessionTag = sessionTagOf
 
 interface SummaryConfig {
   readonly summarizationProvider: string
@@ -172,7 +176,7 @@ export async function summarizeWithLlm(
     ...input.messages,
     createUserMessage({
       content: [{ type: 'text', text: COMPACTION_INSTRUCTION }],
-      source: { kind: 'plugin', plugin: 'dsh-compaction-basic' },
+      source: { kind: 'dsh-agent-compact' },
     }),
   ]
   const options: GenerateOptions = {
@@ -512,7 +516,7 @@ export async function agentSummarize(
     agent.send(
       createUserMessage({
         content: [{ type: 'text', text: AGENT_COMPACTION_INSTRUCTION }],
-        source: { kind: 'plugin', plugin: 'dsh-agent-compact' },
+        source: { kind: 'dsh-agent-compact' },
       }),
       'next-turn',
       true,
@@ -612,7 +616,8 @@ export async function agentSummarize(
   })
   return {
     summary,
-    rawOutput: message.content,
+    // `Message.content` is readonly since 0.1.7; the raw-output contract wants a mutable array.
+    rawOutput: [...message.content],
     provider: target.provider,
     model: target.model,
     ...usage === undefined ? {} : { usage },

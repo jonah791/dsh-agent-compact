@@ -95,8 +95,23 @@
 
 **断点即最后一条非 `abort` 阶段**；事务失败必写 `abort`（带 `error` 与已等毫秒数）。
 
+**`trigger` 字段（2026-09-23 补 · v0.1.4）**：自动路径原先**零轨迹**（三处失败只写 `ctx.logger.warn`，而宿主 logger 不落盘）⇒ 写坏会话后无法回答「哪条路径写的」。现四条路径都在调用点记账：
+
+| `trigger` | 触发者 | 落账阶段 |
+|-----------|--------|---------|
+| `step-pressure` | `agent/pre-step` 步间压力 | `captured` / `abort`（配置类错误按 targetKey 只落一次） |
+| `context-overflow` | `agent/request-error` 请求溢出恢复 | `captured` / `abort`（带 `note: durable-surface-progress` 区分「已有表层进展」） |
+| `manual-idle` | `compactNow` 空闲会话（同步等结果） | `captured` / `abort` |
+| `manual-busy` | `compactNow` 忙会话（fire-and-forget） | `captured` / `abort` |
+
+不落 `begin`：自动路径每次 pre-step 都会试压，未越阈值即返回 `null`——为「没压」记账只会淹没轨迹。**「有没有压、压没压成、断在哪」由 `captured`/`abort` 回答**。
+
+**`session` 字段的区分力（2026-09-23 修正）**：原实现取 `id.slice(0,8)`，而真实 id 形如 `session-9919ca78-…` ⇒ 每个会话都得到同一个 `session-`（字段在假装提供信息）。现剥掉通用前缀后取 8 位（`9919ca78`）。本日之前的轨迹行该字段无信息量，读侧不必兼容。
+
 导出的原语（`src/trace.ts`，并被主入口**转出**供 provider 复用）：
-`resolveHome()`（`DSH_HOME` → `homedir()/.dsh`）、`compactionTracePath()`、`serializeTraceEntry()`（稳定键序单行 JSON）、`parseTraceEntries()`（坏行跳过不抛）、`readTraceEntries()`、`buildStamp()`（`<version>@<模块 mtime ms>`——**版本号会说谎，mtime 不会**）、`BUILD`、`appendTraceEntry()`（失败即吞返回 `false`）、`trace()`。
+`resolveHome()`（`DSH_HOME` → `homedir()/.dsh`）、`compactionTracePath()`、`serializeTraceEntry()`（稳定键序单行 JSON）、`parseTraceEntries()`（坏行跳过不抛）、`readTraceEntries()`、`sessionTagOf()`（**2026-09-23 新增**：剥 `session-` 前缀取 8 位，单一真源）、`buildStamp()`（`<version>@<模块 mtime ms>`）、`BUILD`、`appendTraceEntry()`（失败即吞返回 `false`）、`trace()`。
+
+> **`buildStamp` 的版本段（2026-09-23 修正）**：原先从模块旁的 `package.json` 读版本，而消费方以 `file:` 依赖安装时 pnpm 会**复制并重写** `package.json`（快照），只有 `lib/*.js` 是硬链接 ⇒ 实测同一个构建里**代码新、版本旧**（轨迹写着 `0.1.0@1790131527923`，而该 mtime 正是新产物的 mtime）。现版本段取自随源码走的 `VERSION` 常量（`src/version.ts`，产物同为硬链接）——`package.json` 降级为回退来源，两者一致性由测试守门。**mtime 是真源，版本段现在也真了。**
 
 不变量：
 - **I9 判据单一真源**：消费方**必须**经主入口转出复用本模块（`import { compactTrace } from 'dsh-agent-compact'`），**不得**自建第二套路径解析/序列化。
@@ -128,6 +143,11 @@
 | A5 | 一次事务只有一条摘要路径（无双投递） | `scripts/compaction-forensics.py` injections=1 | 已实测 |
 | A6 | 投递失败后有界重发（≤2 次）后仍无表层 → fail loud | 单测 `nextInstructionAttempt`（resend → fail） | 已实测（单测）/ **待线上验收**（真实重发） |
 | A7 | busy 会话 `compactNow` 立即返回、事务后台完成 | 事件流 8092→8108（同轮内完成） | 已实测 |
+| A8 | **属主回合 = 提交那一刻的 openTurn**：摘要期间回合结束，`start/summary/end` 仍落在**新**回合内（且三件套相邻无 `turn/*` 夹入） | 单测 `tests/owner-turn.test.mjs`（真实 harness Session + 真实 region 事务，summarize 桩在 await 内推进回合） | 已实测 |
+| A9 | 空闲会话的属主回合为 `null`（读侧接受，不伪造回合号） | 同上（第二例） | 已实测 |
+| A10 | 自动路径的失败必落侧车轨迹（`trigger` + `abort`），不再只进 `ctx.logger` | 源码接线（`traceAutomatic` × 4 处）+ 单测 `trigger` 字段 | 已实测（字段）/ **待线上验收**（真实自动压缩一笔） |
+| A11 | 构建标识的版本段取自源码（`VERSION`），不受消费方副本陈旧 `package.json` 影响 | 单测：`VERSION === package.json.version` + 源码级断言「不得出现 `'package.json'`」 | 已实测 |
+| A12 | 夹具不依赖运行平台（Windows `E:/…` 与 WSL `/mnt/e/…` 都能真跑，不再走 skip 假绿） | `pickRoot()`；实测 Windows `npm test` 32/32、WSL `node --test` 32/32，`skipped 0` | 已实测 |
 
 ## 8 · 与实现的关系
 
@@ -136,6 +156,29 @@
 - 未实现/未验证部分**显式标注**：① `auto:true` 的两条 replay 路径在本部署**未启用**，其行为仅有单测与代码证据 ② 重发路径尚无真实失败样本（A6 待线上验收）
 
 ## 9 · 实践修订记录
+
+- **2026-09-23 0.1.7 契约适配 + 观测缺口闭合（v0.1.4）**
+  - **背景**：DSH 由 `0.1.6-alpha.2` 升到 `0.1.7-alpha.1`（会话格式 v3→v4）。读侧新增硬判据
+    `turn/end crosses an open compaction`（`session-format-v3-to-v4/src/relationships.ts:229-237/270-271`），
+    把「compaction 必须完整闭合在属主回合内」从**约定**变成**硬拒收**——**12 个会话因此打不开**。
+  - 语义**被修正（事故根因）**：旧实现先 append `compaction/start`（以入口时的 `openTurn` 当属主）
+    再 `await` 摘要（实测可达 120s）⇒ 回合在 await 内结束，`summary`/`end` 落进下一回合。
+    改为「**先摘要、后开事务**」：`start→summary→end` 同一 tick 连续落盘，属主回合 = **提交那一刻**
+    开着的回合（空闲则 `null`）。守卫见 A8/A9（`tests/owner-turn.test.mjs`，真实 Session + 真实事务）。
+  - 语义**被修正（失败可见性）**：start 之前失败不再留未闭合 `start`（那是读侧拒收的形状）⇒
+    旧设计依赖的「可检测的未闭合 start」消失。**补偿**：所有路径的失败必落侧车 `abort`
+    （原先自动路径三处失败只写 `ctx.logger.warn`，而宿主 logger **不落盘**）。
+  - 语义**被补充（观测覆盖）**：新增 `trigger` 字段（`step-pressure` / `context-overflow` /
+    `manual-idle` / `manual-busy`），自动路径首次有轨迹（A10）。动机是实测代价：修那 12 个会话时
+    无法回答「哪条路径写的 / 哪个构建写的 / 断在哪一阶段」。
+  - 语义**被修正（两个字段曾在假装提供信息）**：① `session` 恒为 `session-`（零区分力，取 id 前 8 位
+    撞上通用前缀）→ 剥前缀取 8 位；② `build` 的版本段恒为副本 `package.json` 的陈旧版本
+    （实测 `0.1.0@1790131527923`，而该 mtime 正是新产物）→ 改读随源码走的 `VERSION` 常量（A11）。
+  - 语义**被修正（测试假绿）**：夹具硬编码 `E:/…`，在 WSL 里 `existsSync` 恒 false ⇒ 走
+    `process.exit(0)` 的 skip 分支，而 `node --test` **记成 pass** ⇒ 三个断言（含尸体测试）
+    从未执行。加 `pickRoot()` 平台回退（A12）。**教训：`skipped 0` 必须是验收读数的一部分。**
+  - **未做 / 未决**：真实自动压缩的一笔线上验收（A10 后半）；`dsh-agent-teams` 的 client bundle
+    重建（0.1.7 升级遗留，与压缩路径无关但同批）。
 
 - **2026-09-14 侧车轨迹 + 文档回修（可维护性补课）**
   - 语义**被补充**：新增 §4.5——`src/trace.ts` 把事务过程落成 `<DSH_HOME>/compaction-trace.jsonl`（此前只写 `ctx.logger`，而宿主 logger **不落盘**）。**本文档此前遗漏了这次回修**（§5.20 I3 违规），本次补齐。

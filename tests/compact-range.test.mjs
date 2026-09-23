@@ -24,8 +24,22 @@ import { existsSync } from 'node:fs'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-const HARNESS = process.env.DSH_HARNESS_ROOT ?? 'E:/alice/deepseek-harness'
-const PLUGIN = process.env.DSH_COMPACT_ROOT ?? 'E:/alice/self-plugins/dsh-agent-compact'
+/**
+ * 路径解析：Windows 形态优先，缺失时回退 WSL 形态（`E:/x` → `/mnt/e/x`）。
+ *
+ * 为什么要有（2026-09-23 实测）：本夹具原先硬编码 `E:/…`，在 WSL 里 `existsSync` 恒 false
+ * ⇒ 走 `[skip]` 分支 `process.exit(0)`，而 `node --test` 记成 **pass** ⇒ **假绿**：
+ * 三个断言（含尸体测试）从未执行过，回归面却显示全绿。夹具不得依赖运行平台。
+ * @param winPath - Windows 形态的绝对路径。
+ * @returns 本机真实存在的那个形态。
+ */
+function pickRoot(winPath) {
+  if (existsSync(winPath)) return winPath
+  return winPath.replace(/^([A-Za-z]):/, (_, drive) => `/mnt/${drive.toLowerCase()}`)
+}
+
+const HARNESS = process.env.DSH_HARNESS_ROOT ?? pickRoot('E:/alice/deepseek-harness')
+const PLUGIN = process.env.DSH_COMPACT_ROOT ?? pickRoot('E:/alice/self-plugins/dsh-agent-compact')
 const sessionLib = `${HARNESS}/packages/core/session/lib/index.js`
 const llmLib = `${HARNESS}/packages/llm/llm/lib/index.js`
 const regionLib = `${PLUGIN}/lib/region.js`

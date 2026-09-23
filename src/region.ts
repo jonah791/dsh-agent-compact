@@ -176,26 +176,15 @@ export async function compactSurfaceRegion(
     'compaction',
   )
 
-  let owner: number | null
   if (options.owner === null) {
     if (entryState.openTurn !== null) {
       throw new ManualCompactionError('busy', 'manual compaction: the session already has an open turn')
     }
-    owner = null
-  } else {
-    if (entryState.openTurn === null) {
-      throw new Error('compactRegion: no open turn — automatic compaction events must be enclosed in a turn')
-    }
-    owner = entryState.openTurn
+  } else if (entryState.openTurn === null) {
+    throw new Error('compactRegion: no open turn — automatic compaction events must be enclosed in a turn')
   }
 
   const compactionId = CompactionId(randomUUID())
-  const lifecycle = {
-    compactionId,
-    ...options.sourceCommandId === undefined ? {} : { sourceCommandId: options.sourceCommandId },
-    turn: owner,
-  }
-  const startEvent = session.append('compaction/start', lifecycle)
   const assertStable: StabilityCheck = options.stability === 'whole-surface'
     ? assertWholeSurfaceUnchanged
     : assertSelectedSpanStable
@@ -219,22 +208,47 @@ export async function compactSurfaceRegion(
     if (options.owner === null) signal?.throwIfAborted()
     assertStable(dependencies, session, summarized)
     stage = 'commit'
-    const pending = commitCompactionBody(session, startEvent, summarized)
-    closing = true
-    const endEvent = session.append('compaction/end', lifecycle)
-    closed = true
-    result = completeCompaction(pending, endEvent)
-  } catch (error: unknown) {
-    failure = { error, stage: closing ? 'commit' : stage }
-    if (!closing) {
+    // 2026-09-23 修复（属主回合必须在**追加 start 的那一刻**读取）。
+    // 读侧 session-format-v3-to-v4/src/relationships.ts:229-237 / 270-271 要求
+    // compaction/summary 与 compaction/end 都落在 compaction/start 的属主回合内，
+    // 且 compaction 开着时不得出现任何 turn/* 事件。而 summarizeCompaction 是一次
+    // LLM 调用（实测可达 120s）——期间本回合可能已 turn/end 并开启新回合。旧实现把
+    // start 提前落盘、以入口时的 openTurn 当属主，于是 summary/end 落进了新回合，
+    // 日志此后被读取器硬拒（turn/end crosses an open compaction，2026-09-23 实测
+    // 12 个会话受害）。改为「先摘要、后开事务」：start→summary→end 在同一 tick 内
+    // 连续落盘，属主回合即提交那一刻开着的回合（空闲则为 null，读侧接受）。
+    const commitTurn = inspectCompactionEntryState(
+      session as unknown as { seq: number; eventAt(seq: number): SessionEvent | undefined },
+    ).openTurn
+    const lifecycle = {
+      compactionId,
+      ...options.sourceCommandId === undefined ? {} : { sourceCommandId: options.sourceCommandId },
+      turn: commitTurn,
+    }
+    const startEvent = session.append('compaction/start', lifecycle)
+    try {
+      const pending = commitCompactionBody(session, startEvent, summarized)
       closing = true
-      try {
-        session.append('compaction/end', { ...lifecycle, error: errorChain(error) })
-        closed = true
-      } catch (closeError: unknown) {
-        failure = { error: closeError, stage: 'commit' }
+      const endEvent = session.append('compaction/end', lifecycle)
+      closed = true
+      result = completeCompaction(pending, endEvent)
+    } catch (error: unknown) {
+      failure = { error, stage: 'commit' }
+      if (!closing) {
+        closing = true
+        try {
+          session.append('compaction/end', { ...lifecycle, error: errorChain(error) })
+          closed = true
+        } catch (closeError: unknown) {
+          failure = { error: closeError, stage: 'commit' }
+        }
       }
     }
+  } catch (error: unknown) {
+    // 失败发生在 start 落盘之前（摘要失败 / 稳定性校验失败 / start append 本身失败）：
+    // 事务从未持久化，因此不追加任何事件 —— 绝不留下未闭合的 compaction/start，
+    // 也绝不把闭合事件写进非属主回合。
+    failure = { error, stage }
   }
 
   if (closed && options.flush !== undefined) {

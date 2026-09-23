@@ -22,6 +22,7 @@ import { appendFileSync, mkdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { VERSION } from './version.ts'
 
 /**
  * 阶段枚举：一笔记账从 boot（进程级）到 captured / abort（事务级）。
@@ -55,6 +56,14 @@ export interface TraceEntry {
   build: string
   /** 写者：`provider`（工具入口侧）/ `engine`（seam 侧）。缺省视为 engine（向后兼容旧行）。 */
   side?: 'provider' | 'engine'
+  /**
+   * 触发路径（2026-09-23 新增）：`step-pressure`（步间压力）/ `context-overflow`（请求溢出恢复）
+   * / `manual-idle`（空闲会话手动）/ `manual-busy`（忙会话手动，fire-and-forget）。
+   *
+   * 为什么必须记：自动路径原先**零轨迹**，一旦写坏会话只能事后反解事件流去猜
+   * 「谁写的 / 哪个构建写的 / 断在哪一阶段」——2026-09-23 修 12 个会话时正是这个处境。
+   */
+  trigger?: string
   /** provider：`session_compact` 的 reason 摘要（截断，仅决策留痕）。 */
   reason?: string
   /** provider：调用方声明的 commandId（如 `alice-self-compact`）。 */
@@ -94,6 +103,27 @@ export function resolveHome(
   return raw !== undefined && raw.trim() !== '' ? raw : join(fallback, '.dsh')
 }
 
+/**
+ * 会话标识摘要（8 位前缀）：轨迹里区分并存会话的最小字段。
+ *
+ * 单一真源（§5.22 规则 4）：原先只有 `summarizer.ts` 里有这份实现（module-private），
+ * 自动路径要记同一字段时**只能复制**——复制品一旦漂移，两处的 `session` 就对不上、
+ * 没法 join。故提到证据层并导出，两侧共用。
+ *
+ * ⚠ **2026-09-23 修正（原实现零区分力）**：真实会话 id 形如
+ * `session-9919ca78-70a7-478a-84cb-…`，直接 `slice(0,8)` 得到的是**每个会话都一样的**
+ * `session-`——字段在假装提供信息。改为剥掉通用前缀 `session-` 后再取 8 位（`9919ca78`）。
+ * 兼容性：本日之前写入的轨迹行 `session` 恒为 `session-`（无信息量），读侧不必兼容。
+ * @param session - 会话对象（形状宽松：只读可选 `id`）。
+ * @returns 8 位标识；拿不到时 `undefined`（轨迹字段可缺，不得因它抛错）。
+ */
+export function sessionTagOf(session: unknown): string | undefined {
+  const id = (session as { id?: unknown } | null)?.id
+  if (typeof id !== 'string' || id === '') return undefined
+  const stripped = id.startsWith('session-') ? id.slice('session-'.length) : id
+  return stripped === '' ? undefined : stripped.slice(0, 8)
+}
+
 /** 轨迹文件路径（纯函数，便于测试与文档化）。 */
 export function compactionTracePath(home: string): string {
   return join(home, 'compaction-trace.jsonl')
@@ -106,6 +136,7 @@ export function serializeTraceEntry(entry: TraceEntry): string {
     phase: entry.phase,
     build: entry.build,
     ...(entry.side !== undefined ? { side: entry.side } : {}),
+    ...(entry.trigger !== undefined ? { trigger: entry.trigger } : {}),
     ...(entry.reason !== undefined ? { reason: entry.reason } : {}),
     ...(entry.commandId !== undefined ? { commandId: entry.commandId } : {}),
     ...(entry.agentId !== undefined ? { agentId: entry.agentId } : {}),
@@ -149,18 +180,28 @@ export function readTraceEntries(path: string): TraceEntry[] {
   }
 }
 
-/** 构建标识：`<version>@<模块文件 mtime ms>`——版本号会说谎，mtime 不会。 */
+/**
+ * 构建标识：`<version>@<模块文件 mtime ms>`。
+ *
+ * ⚠ **2026-09-23 修正（版本号曾会说谎）**：原先版本号从模块旁的 `package.json` 读，
+ * 而消费方以 `file:` 依赖安装时 pnpm 会**复制并重写** `package.json`（快照），
+ * 只有 `lib/*.js` 是硬链接 ⇒ 实测同一个构建里「代码新、版本旧」（trace 里写着
+ * `0.1.0@1790131527923`，而该 mtime 正是新产物的 mtime）。改读随源码走的
+ * `VERSION` 常量（`src/version.ts`）——它与产物同为硬链接，副本里也是新值。
+ *
+ * `version` 显式传入时优先（测试与外部注入用）。
+ * @param moduleUrl - 产物模块 URL（`import.meta.url`）。
+ * @param version - 版本覆盖（缺省用 `VERSION`）。
+ * @returns `<version>@<mtimeMs>`；取不到文件时 `unknown@unknown`（不抛）。
+ */
 export function buildStamp(moduleUrl: string, version?: string): string {
-  let stamp = 'unknown'
   try {
     const file = fileURLToPath(moduleUrl)
-    stamp = String(statSync(file).mtimeMs)
-    const pkg = JSON.parse(readFileSync(join(dirname(file), '..', 'package.json'), 'utf8')) as { version?: string }
-    if (typeof pkg.version === 'string' && pkg.version !== '') return `${pkg.version}@${stamp}`
+    return `${version ?? VERSION}@${String(statSync(file).mtimeMs)}`
   } catch {
     // 构建标识是尽力而为：拿不到也不得影响压缩主流程
+    return 'unknown@unknown'
   }
-  return `unknown@${stamp}`
 }
 
 /** 本次进程的构建标识（模块加载时算一次）。 */
