@@ -31,6 +31,10 @@ import { VERSION } from './version.ts'
  *  - **引擎侧**：`detected`（识别到合法 checkpoint 块）→ `committed`（表层已换血）；
  *    `skipped`（是意图但没压：幂等 / 无可压区间 / 拿不到 agent）；
  *    `rejected`（**有哨兵但不合法**——写坏了，必须响亮）；`abort`（事务抛错）
+ *  - **存档侧**（2026-09-27 新增，**非阻塞派发**）：`archive-dispatched`（已派发、立即返回）
+ *    → `archive-settled`（落定，带 `durationMs` / `ok` / `error`）；`archive-skipped`
+ *    （单飞命中：上一次未落定，或 checkpoint 服务不在本组合）。存档不再是提交路径的
+ *    阶段——实测等它要 27 秒，而事务只 66 ms（见 `archive.ts`）。
  *  - **工具侧**（`dsh-compact-provider`）：`requested` → `completed` / `failed`
  * 两侧用 `side` 字段区分。**一条 `tail` 即可回答「谁发起 / 断在哪一段 / 结果 / 耗时」。**
  *
@@ -47,6 +51,9 @@ export type TracePhase =
   | 'skipped'
   | 'committed'
   | 'abort'
+  | 'archive-dispatched'
+  | 'archive-settled'
+  | 'archive-skipped'
   | 'begin'
   | 'queued'
   | 'waited'
@@ -88,8 +95,18 @@ export interface TraceEntry {
   surfaceSeqs?: number[]
   /** 已等待毫秒数（历史字段：0.1.x 投递链的等待时长；标记路径不等任何人）。 */
   waitedMs?: number
-  /** 压缩前存档耗时 ms——`committed` 行的阶段分解之一（保命网，可失败）。 */
+  /**
+   * 压缩前存档耗时 ms。
+   *
+   * **历史字段（2026-09-27 起不再写）**：存档已改为**非阻塞派发**（`archive.ts`），
+   * 它不再是提交路径的一个阶段，故不再出现在 `committed` 行。留着类型与序列化只为
+   * 向后兼容旧轨迹行（读侧按字符串处理，不受影响）。
+   * ⚠ 别再往这里写「派发耗时」——那会是恒 0 的占位，与已废的 `waitedMs: 0` 同型
+   * （看着像读数、实际是常量）。存档耗时归 `archive-settled` 行的 `durationMs`。
+   */
   archiveMs?: number
+  /** 存档耗时 ms（`archive-settled` 行）；在 `archive-skipped` 行表示「上一次已跑多久」。 */
+  durationMs?: number
   /** 表层替换事务耗时 ms（含两次全表 token 计量）——`committed` 行的阶段分解之一。 */
   txnMs?: number
   /**
@@ -164,6 +181,7 @@ export function serializeTraceEntry(entry: TraceEntry): string {
     ...(entry.surfaceSeqs !== undefined ? { surfaceSeqs: entry.surfaceSeqs } : {}),
     ...(entry.waitedMs !== undefined ? { waitedMs: entry.waitedMs } : {}),
     ...(entry.archiveMs !== undefined ? { archiveMs: entry.archiveMs } : {}),
+    ...(entry.durationMs !== undefined ? { durationMs: entry.durationMs } : {}),
     ...(entry.txnMs !== undefined ? { txnMs: entry.txnMs } : {}),
     ...(entry.totalMs !== undefined ? { totalMs: entry.totalMs } : {}),
     ...(entry.chars !== undefined ? { chars: entry.chars } : {}),

@@ -26,6 +26,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import { createArchiveDispatcher } from './archive.ts'
 import { CHECKPOINT_SENTINEL, frameSummary, parseCheckpointBlock } from './checkpoint-block.ts'
 import type { CheckpointBlock } from './checkpoint-block.ts'
 import { assistantTextOf, latestCompactionEndSeq, selectMarkerSpan } from './marker.ts'
@@ -97,9 +98,36 @@ export class AgentCompactEngine extends CompactionEngine {
   /** 已解析的部署配置。 */
   readonly config: ResolvedCompactConfig
 
+  /**
+   * 存档派发器（**非阻塞**）：调用即返回，存档在后台跑完并自落轨迹。
+   *
+   * 为什么不让 `commit` 直接 `await checkpoint.create()`（0.2.1 的写法）：线上实测
+   * 那一等就是 **27,270 ms**，而事务本身只 66 ms。存档是保命网、不是前置条件，
+   * 却让每次压缩白等二十多秒（完整归因见 `archive.ts` 顶部）。
+   */
+  private readonly archiveDispatch: (trigger: string) => void
+
   constructor(ctx: Context, config: CompactConfig = {}) {
     super(ctx)
     this.config = resolveConfig(config)
+    this.archiveDispatch = createArchiveDispatcher({
+      create: async (reason: string): Promise<void> => {
+        const checkpoint = this.ctx.get('checkpoint') as
+          | { create(reason: string): Promise<unknown> }
+          | undefined
+        if (checkpoint === undefined) {
+          // 派发前已查过；走到这里说明服务在派发后被卸载——响亮，不假装成功
+          throw new Error('checkpoint service disappeared after dispatch')
+        }
+        await checkpoint.create(reason)
+      },
+      trace: (entry) => {
+        trace(entry)
+      },
+      warn: (message: string) => {
+        this.ctx.logger.warn(message)
+      },
+    })
     if (this.config.enabled) this.registerMarkerPath()
   }
 
@@ -179,13 +207,13 @@ export class AgentCompactEngine extends CompactionEngine {
       return null
     }
     const startedAt = Date.now()
-    const { result, archiveMs, txnMs } = await this.commit(
+    const { result, txnMs } = await this.commit(
       session as unknown as Session, span.start as SessionSeq, span.end as SessionSeq,
       agent, summary, 'tool', sourceCommandId,
     )
     trace({
       phase: 'committed', trigger: 'tool', session: sessionTagOf(session),
-      chars: summary.length, archiveMs, txnMs, totalMs: Date.now() - startedAt,
+      chars: summary.length, txnMs, totalMs: Date.now() - startedAt,
       note: 'shadowed ' + String(result.shadowedSeqs.length) + ' nodes (seqs '
         + String(result.shadowedRange.start) + '-' + String(result.shadowedRange.end) + ')',
     })
@@ -270,7 +298,7 @@ export class AgentCompactEngine extends CompactionEngine {
     })
     const startedAt = Date.now()
     try {
-      const { result, archiveMs, txnMs } = await this.commit(
+      const { result, txnMs } = await this.commit(
         session as unknown as Session,
         span.start as SessionSeq,
         span.end as SessionSeq,
@@ -280,7 +308,7 @@ export class AgentCompactEngine extends CompactionEngine {
       )
       trace({
         phase: 'committed', trigger: 'marker', session: sid, seqFloor: markerSeq,
-        chars: parsed.chars, archiveMs, txnMs, totalMs: Date.now() - startedAt,
+        chars: parsed.chars, txnMs, totalMs: Date.now() - startedAt,
         note: 'shadowed ' + String(result.shadowedSeqs.length) + ' nodes (seqs '
           + String(result.shadowedRange.start) + '-' + String(result.shadowedRange.end) + ')',
       })
@@ -309,10 +337,11 @@ export class AgentCompactEngine extends CompactionEngine {
     body: string,
     trigger: 'marker' | 'tool',
     sourceCommandId?: string,
-  ): Promise<{ result: CompactionResult; archiveMs: number; txnMs: number }> {
-    const archiveStartedAt = Date.now()
-    await this.archiveBestEffort(trigger)
-    const archiveMs = Date.now() - archiveStartedAt
+  ): Promise<{ result: CompactionResult; txnMs: number }> {
+    // 存档**不等**（2026-09-27 线上实测）：等它要 27,270 ms，而事务本身只 66 ms。
+    // 语义安全：存档内容是 storages + AGENTS.md，而压缩只改**会话事件流**，
+    // 两者无因果关系 ⇒ 并行不产生竞态。
+    this.dispatchArchive(trigger)
     const blocks: ContentBlock[] = [{ type: 'text', text: body }]
     const txnStartedAt = Date.now()
     const result = await compactSurfaceRegion(
@@ -337,22 +366,25 @@ export class AgentCompactEngine extends CompactionEngine {
         flush: async () => { await this.ctx.sessions.flush(session) },
       },
     )
-    return { result, archiveMs, txnMs: Date.now() - txnStartedAt }
+    return { result, txnMs: Date.now() - txnStartedAt }
   }
 
-  /** 压缩前存档（保命优先）：checkpoint 服务不可用或失败都不阻塞压缩。 */
-  private async archiveBestEffort(trigger: string): Promise<void> {
-    const checkpoint = this.ctx.get('checkpoint') as
-      | { create(reason: string): Promise<unknown> }
-      | undefined
-    if (checkpoint === undefined) return
-    try {
-      await checkpoint.create('压缩前自动存档（' + trigger + '）')
-    } catch (error: unknown) {
-      // 存档是保命网不是前置条件：失败只记账，不拦压缩（压缩本身可重来）
-      this.ctx.logger.warn('pre-compaction checkpoint failed: '
-        + (error instanceof Error ? error.message : String(error)))
+  /**
+   * 派发一次压缩前存档（**不阻塞**，立即返回）。
+   *
+   * 服务不在本组合时**留证而不是静默**（§5.10：静默失败是死亡温床）——跳过行写明原因，
+   * 于是「为什么这次没存档」一条 `tail` 可答；原先的 `if (checkpoint === undefined) return`
+   * 是无声的，从侧车上看与「存档成功」无从区分。
+   */
+  private dispatchArchive(trigger: string): void {
+    if ((this.ctx.get('checkpoint') as unknown) === undefined) {
+      trace({
+        phase: 'archive-skipped',
+        note: 'checkpoint 服务不在本组合（未挂载 dsh-agent-checkpoint？）',
+      })
+      return
     }
+    this.archiveDispatch(trigger)
   }
 
   /** 注入一条可见的失败告知（同 seq 只报一次；投递绝不反噬主流程）。 */
