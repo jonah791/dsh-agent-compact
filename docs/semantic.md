@@ -1,12 +1,14 @@
 # 语义文档：标记驱动压缩引擎（Marker-Driven Compaction Engine）
 
-> 版本 v0.2.0 · 2026-09-27 · 作者：爱丽丝 · 状态：**已实现（待线上验收）**
+> 版本 v0.2.1 · 2026-09-27 · 作者：爱丽丝 · 状态：**已实现（线上首笔压缩已验收；A12 待验）**
 > 主人指令：「重新设计压缩插件，围绕智能体自主压缩」（2026-09-27）
 > 开发方式：语义文档优先（先写清「是什么/什么关系/怎么裁决」，再让实现逼近，最后用实践回修）
 > 实现落点：`self-plugins/dsh-agent-compact/src/{index,checkpoint-block,marker,region,config,trace}.ts`
 > ⚠ 0.1.x 的投递链设计（`agentSummarize` / 指令投递 / 表层取证 / 候选捕获）已**整体删除**；
-> 其完整文档与事故史见本文件 git 历史（`git log -p -- docs/semantic.md`）。本文只描述 0.2.0
+> 其完整文档与事故史见本文件 git 历史（`git log -p -- docs/semantic.md`）。本文只描述 0.2.x
 > 的现状与继承下来的判据。
+> ✅ 线上首笔（2026-09-27 11:26，本会话）已实测通过：`detected → committed`、上下文
+> 344,734 → 86,905 tok、标记消息与事务之间零额外请求（§9 有完整读数）。
 
 ---
 
@@ -141,7 +143,7 @@ shadowedTokenCount, provider, model}` → `user/message{surfaceOp:{op,startSeq,e
 |--------|------|------|
 | 缺省（引擎） | `boot` | 进程加载自报：版本 + inject + 路径 + `auto=none` |
 | 缺省 | `detected` | 识别到合法块（带 `seqFloor` / `chars` / `agentId`） |
-| 缺省 | `committed` | 表层已换血（`note` 含遮蔽节点数与 seq 区间） |
+| 缺省 | `committed` | 表层已换血（`note` 含遮蔽节点数与 seq 区间；`archiveMs`/`txnMs`/`totalMs` 给阶段耗时） |
 | 缺省 | `skipped` | 是意图但没压（幂等 / 无可压区间 / 拿不到 agent），`note` 给理由 |
 | 缺省 | `rejected` | **有哨兵但不合法**——写坏了（`error` 给具体护栏） |
 | 缺省 | `abort` | 事务抛错（`error` 给原因） |
@@ -149,6 +151,11 @@ shadowedTokenCount, provider, model}` → `user/message{surfaceOp:{op,startSeq,e
 
 **断点即最后一条非终态阶段**。`build` 字段自证「线上跑的是哪个构建」（版本段取自随源码走的
 `VERSION` 常量，不信消费方副本的陈旧 `package.json`）。
+
+**耗时三字段（0.2.1 补，线上首笔实测驱动）**：`archiveMs`（压缩前存档）/ `txnMs`（表层替换事务，
+含 `region.ts` 对整张表层做的**两次** `meter.measure`）/ `totalMs`（`detected`→`committed` 端到端）。
+补它们是因为 0.2.0 的 `committed` 行只写了一个**硬编码** `waitedMs: 0`——看起来像读数、实际是常量，
+于是「detected 到 committed 之间那 21.9 秒花在哪」答不出来（§5.22 五问之⑤形同虚设）。
 
 ## 5 · 边界与信任
 
@@ -183,9 +190,11 @@ shadowedTokenCount, provider, model}` → `user/message{surfaceOp:{op,startSeq,e
 | A7 | 幂等：处理后 markerSeq < `compaction/end` seq | 单测 `marker.test.mjs` | 已实测 |
 | A8 | 事务事件序列与官方字节兼容 + 属主回合正确 | 既有 `tests/owner-turn.test.mjs`、`compact-range.test.mjs`（真 Session + 真事务） | 已实测 |
 | A9 | 组合装载成功（新 config schema + 新构建） | `preflight_check` full 通过；`compaction-trace.jsonl` boot 行 `0.2.0@1790479147323` | 已实测 |
-| A10 | **线上真实压缩一笔**：块 → `detected` → `committed`，上下文显著缩小 | 待下一次真实压缩 | **待线上验收** |
-| A11 | 零额外请求：压缩轮不产生额外的全上下文请求 | 对比 `assistant/message.usage` 与压缩前后 `tokenMeter` | **待线上验收** |
+| A10 | **线上真实压缩一笔**：块 → `detected` → `committed`，上下文显著缩小 | 2026-09-27 11:26 本会话实压：侧车 `detected`(seqFloor=745, chars=5041) → `committed`(shadowed 364 nodes, seqs 8-744, txnMs≈21890)；`context_health` 344,734 → 86,905 tok（−74.8%） | 已实测 |
+| A11 | 零额外请求：压缩轮不产生额外的全上下文请求 | 事件流 seq745（标记）→ seq748（`compaction/start`）之间**零** `request/header`、零 `assistant/message`；压缩后首个请求在 seq760；存档 `createdAt` 与 `detected` 同秒（24 ms 级） | 已实测 |
 | A12 | 非法块在下个 step 可见（告知真的注入） | 待一次真实误写 | **待线上验收** |
+| A13 | 识别**只读文本块**：推理块与流式副本里的哨兵不参与判定 | 线上实证：标记消息事件含 **6 个**哨兵（`content[0]` reasoning 2 个 + `content[1]` text 1 个 + `stream` 镜像 3 个），仍判合法并压缩成功 | 已实测 |
+| A14 | 区间端点正确：标记消息**自身不被吞** | 线上实证：`seqFloor=745` 即标记消息 seq，被遮蔽区间为 `8-744`——端点取「标记消息之前一个表层节点」 | 已实测 |
 
 ## 8 · 与实现的关系
 
@@ -193,8 +202,9 @@ shadowedTokenCount, provider, model}` → `user/message{surfaceOp:{op,startSeq,e
   （识别与包装，纯函数）、`src/marker.ts`（区间与幂等，纯函数）、`src/region.ts`（表层事务，
   继承 0.1.x，仅改「摘要入参为 thunk」）、`src/config.ts`、`src/trace.ts`
 - 同语义副本：无（本仓为主副本）；消费方契约见 `dsh-compact-provider/docs/semantic.md`
-- 未实现/未验证部分**显式标注**：A10/A11/A12 需一次真实压缩；`setImmediate` 提交在
-  「回合内 / 回合间」两种时序下的实测各需一笔
+- 未实现/未验证部分**显式标注**：A12（非法块告知）待一次真实误写；U1 的「回合间」时序已实测
+  （2026-09-27 首笔即回合间：`compaction/start` 落在 `turn/end` 之后、下一 `turn/start` 之前），
+  「回合内」时序待一笔；U5（22 秒的去向）待带阶段计时的下一笔实测确认
 
 ## 9 · 实践修订记录
 
@@ -224,12 +234,39 @@ shadowedTokenCount, provider, model}` → `user/message{surfaceOp:{op,startSeq,e
     最近一笔（2026-09-26）正是投递链的捕获漂移（108 字符碎片被地板拦下，**上下文毫发未缩**）。
     官方 `compaction-basic`（auto:true，挂在会话预设 realm）**从未触发**（全部 84 笔都带
     `alice-self-compact`）——顺手确认了「框架自动压缩」在实际运行中未发生。
+- **2026-09-27 线上首笔验收（v0.2.0 部署后当天，A10/A11/A13/A14）**
+  - **本体**：本会话（`f551f590`）在 11:26 用新机制压了自己一笔——块写在干活那一轮的末尾
+    （先汇报、后写块），**与任务产出共存**，正是承重设计要保证的用法。
+  - **读数**：侧车 `detected`(11:26:27.757, `trigger=marker`, chars=5041, seqFloor=745) →
+    `committed`(11:26:49.684, `shadowed 364 nodes (seqs 8-744)`)；`context_health`
+    **344,734 → 86,905 tok（−74.8%）**；存档 `20260927-112627-2047ce`（7.0 MB）。
+  - **零额外请求的铁证**：事件流 `seq745`（标记消息）→ `seq748`（`compaction/start`）之间
+    **没有任何** `request/header` 或 `assistant/message`；压缩后首个模型请求在 `seq760`。
+  - **一处设计假设被线上推翻（关键）**：识别「只读文本块」原先只是**论证**上的严谨，线上
+    实测出它的**必要性**——那条标记消息事件里哨兵共 **6 个**（`content[0]` reasoning 块 2 个、
+    `content[1]` text 块 1 个、`stream` 镜像 3 个）。若解析器读整个事件或读推理块，就会命中
+    多哨兵 ⇒ 按「不猜」判 `invalid` ⇒ **第一次线上压缩当场失败**。护栏的「首要误触发面」不是
+    假想敌。（A13）
+  - **失败即静默的反面**：`compaction/start.turn = null`——提交发生在 `turn/end` 之后、下一
+    `turn/start` 之前，读侧接受空闲属主（与 2026-09-23 的读侧硬判据一致）。
+  - **暴露的可维护性缺口（自指闭环的收获）**：本笔 `committed` 行只有硬编码 `waitedMs: 0`，
+    答不出「21.9 秒花在哪」——当场补 `archiveMs`/`txnMs`/`totalMs` 三字段并配尸体测试
+    （v0.2.1）；根因候选记 U5。**验收不只是确认设计对，也包括让机制说出自己的代价。**
 
 ## 10 · 未决问题
 
-- **U1** `setImmediate` 提交的两条时序（回合内 / 回合间）都需一次真实压缩的读数（A10）
+- **U1** `setImmediate` 提交的两条时序（回合内 / 回合间）：**回合间已实测**（2026-09-27 首笔，
+  `turn/end` → `compaction/start` → `compaction/end` → 下一 `turn/start`，`turn: null` 被读侧接受）；
+  回合内（压缩与未闭合回合并存）待一笔
 - **U2** 是否需要一个「压缩体检」工具（列最近 N 笔压缩的轨迹 + 结果）——当前靠 `tail` 侧车
 - **U3** 若某轮同时写了两个哨兵（意图不明）会被判 `invalid` 并告知；是否该支持「压最后一块」
   （当前判：**不猜**，宁可让 agent 重写）
 - **U4** 预设 realm 里的官方 `compaction-basic`（auto:true）虽未观测到触发，但它的存在是
   一个「潜在的第二个压缩者」——是否该显式关掉（需要改预设 realm，属组合变更）
+- **U5** **22 秒的延迟（0.2.1 待测）**：首笔 `detected`→`committed` 实测 21.9 秒，而存档
+  `createdAt` 与 `detected` 同秒 ⇒ 时间不在存档，指向 `region.ts` 对整张表层做的**两次**
+  `meter.measure`（`prepareCompaction` 与 `assertSelectedSpanStable` 各一次，实际 344k token）。
+  这是**继承自 0.1.x 的既有成本**（旧路径在此之上还要叠加一次可达 120 秒的 LLM 摘要请求），
+  本轮未改。0.2.1 已补 `archiveMs`/`txnMs`/`totalMs` 三字段以便下一笔**归因到实证**；
+  若确认是计量，再评估「复用首次计量 / 让计量器按节点缓存」是否安全（**不得**削弱
+  `assertSelectedSpanStable` 的「表层未变」检查——那条检查是历史改写的守门人）

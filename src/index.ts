@@ -178,7 +178,18 @@ export class AgentCompactEngine extends CompactionEngine {
       })
       return null
     }
-    return this.commit(session as unknown as Session, span.start as SessionSeq, span.end as SessionSeq, agent, summary, 'tool', sourceCommandId)
+    const startedAt = Date.now()
+    const { result, archiveMs, txnMs } = await this.commit(
+      session as unknown as Session, span.start as SessionSeq, span.end as SessionSeq,
+      agent, summary, 'tool', sourceCommandId,
+    )
+    trace({
+      phase: 'committed', trigger: 'tool', session: sessionTagOf(session),
+      chars: summary.length, archiveMs, txnMs, totalMs: Date.now() - startedAt,
+      note: 'shadowed ' + String(result.shadowedSeqs.length) + ' nodes (seqs '
+        + String(result.shadowedRange.start) + '-' + String(result.shadowedRange.end) + ')',
+    })
+    return result
   }
 
   /**
@@ -257,8 +268,9 @@ export class AgentCompactEngine extends CompactionEngine {
       phase: 'detected', trigger: 'marker', session: sid, seqFloor: markerSeq,
       chars: parsed.chars, agentId: agent.id,
     })
+    const startedAt = Date.now()
     try {
-      const result = await this.commit(
+      const { result, archiveMs, txnMs } = await this.commit(
         session as unknown as Session,
         span.start as SessionSeq,
         span.end as SessionSeq,
@@ -268,7 +280,7 @@ export class AgentCompactEngine extends CompactionEngine {
       )
       trace({
         phase: 'committed', trigger: 'marker', session: sid, seqFloor: markerSeq,
-        chars: parsed.chars, waitedMs: 0,
+        chars: parsed.chars, archiveMs, txnMs, totalMs: Date.now() - startedAt,
         note: 'shadowed ' + String(result.shadowedSeqs.length) + ' nodes (seqs '
           + String(result.shadowedRange.start) + '-' + String(result.shadowedRange.end) + ')',
       })
@@ -282,7 +294,13 @@ export class AgentCompactEngine extends CompactionEngine {
     }
   }
 
-  /** 一个事务：压缩前保命存档 → 表层替换 → flush。两条入口共用。 */
+  /**
+   * 一个事务：压缩前保命存档 → 表层替换 → flush。两条入口共用。
+   *
+   * 返回值带**阶段耗时**（2026-09-27 线上首笔实测驱动）：侧车原先只写 `waitedMs: 0`
+   * 这个硬编码占位，于是「detected 到 committed 之间那 21.9 秒花在哪」答不出来——
+   * §5.22 五问之⑤（耗时与预算）形同虚设。现按「存档 / 事务」两段如实计时。
+   */
   private async commit(
     session: Session,
     start: SessionSeq,
@@ -291,9 +309,12 @@ export class AgentCompactEngine extends CompactionEngine {
     body: string,
     trigger: 'marker' | 'tool',
     sourceCommandId?: string,
-  ): Promise<CompactionResult> {
+  ): Promise<{ result: CompactionResult; archiveMs: number; txnMs: number }> {
+    const archiveStartedAt = Date.now()
     await this.archiveBestEffort(trigger)
+    const archiveMs = Date.now() - archiveStartedAt
     const blocks: ContentBlock[] = [{ type: 'text', text: body }]
+    const txnStartedAt = Date.now()
     const result = await compactSurfaceRegion(
       {
         meter: this.ctx.tokenMeter,
@@ -316,7 +337,7 @@ export class AgentCompactEngine extends CompactionEngine {
         flush: async () => { await this.ctx.sessions.flush(session) },
       },
     )
-    return result
+    return { result, archiveMs, txnMs: Date.now() - txnStartedAt }
   }
 
   /** 压缩前存档（保命优先）：checkpoint 服务不可用或失败都不阻塞压缩。 */

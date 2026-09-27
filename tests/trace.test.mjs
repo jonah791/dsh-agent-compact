@@ -161,3 +161,65 @@ test('serializeTraceEntry：trigger 紧跟 side，缺省时不出现', () => {
   const noTrigger = serializeTraceEntry({ atMs: 1, phase: 'boot', build: '0.1.4@9' });
   assert.ok(!noTrigger.includes('trigger'));
 });
+
+// ── 2026-09-27 补：阶段耗时（线上首笔实测驱动）────────────────────────────────
+// 现场：0.2.0 标记路径第一次真实压缩，detected→committed 之间隔了 **21.9 秒**，
+// 而侧车那一行只写着 `waitedMs: 0`——**硬编码占位**，于是「这 21.9 秒花在哪」
+// 答不出来（§5.22 五问之⑤形同虚设）。修法：按「存档 / 事务」两段如实计时。
+
+test('serializeTraceEntry：阶段耗时按 archiveMs→txnMs→totalMs 落位，缺省不出现', () => {
+  const line = serializeTraceEntry({
+    atMs: 1790479609684,
+    phase: 'committed',
+    build: '0.2.0@1790479147323',
+    trigger: 'marker',
+    seqFloor: 745,
+    archiveMs: 24,
+    txnMs: 21890,
+    totalMs: 21914,
+    chars: 5041,
+  });
+  assert.equal(
+    line,
+    '{"atMs":1790479609684,"phase":"committed","build":"0.2.0@1790479147323",'
+    + '"trigger":"marker","seqFloor":745,"archiveMs":24,"txnMs":21890,"totalMs":21914,"chars":5041}',
+  );
+  // 三个字段都可缺（boot / rejected 行没有耗时，不得凭空长出来）
+  const bare = serializeTraceEntry({ atMs: 1, phase: 'boot', build: '0.2.0@9' });
+  for (const field of ['archiveMs', 'txnMs', 'totalMs']) {
+    assert.ok(!bare.includes(field), field + ' 不该在无耗时的行里出现');
+  }
+});
+
+test('committed 行不再写硬编码 waitedMs: 0（源码级断言，防回退到占位）', () => {
+  // 尸体样本：修复前 index.ts 的标记路径写死了 `waitedMs: 0` —— 它看起来像读数、
+  // 实际是常量，让「耗时」这个问题永远得到错误的答案（0ms，而真相是 21.9s）。
+  //
+  // ⚠ 口径：判据只扫**代码行**。首版直接 `src.includes('waitedMs: 0')`，被本修复
+  // 自己的历史说明注释命中而假红（2026-09-27 实测）——注释里描述缺陷是**应该的**，
+  // 判据若连注释一起扫，就等于禁止记录历史。注释剥离器是朴素的（不处理字符串里的
+  // `//`），对本文件够用；它只需保证「代码里的占位会红、注释里的引述不会红」。
+  const src = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+  const code = src
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(
+    !code.includes('waitedMs: 0'),
+    'committed 行必须写实测阶段耗时（archiveMs/txnMs/totalMs），不得回退到硬编码占位',
+  );
+  assert.ok(
+    code.includes('archiveMs') && code.includes('txnMs') && code.includes('totalMs'),
+    'commit() 必须按阶段计时并把三段读数交给两条入口',
+  );
+});
+
+test('commit() 的计时覆盖两条入口（标记 / 工具），且返回值形状一致', () => {
+  const src = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
+  // 两条入口都解构同一个返回形状——若某一处漏解构，那条路径的耗时就会静默丢失
+  const destructured = src.match(/const \{ result, archiveMs, txnMs \} = await this\.commit\(/g) ?? [];
+  assert.equal(destructured.length, 2, '标记路径与工具路径都必须解构 { result, archiveMs, txnMs }');
+  assert.ok(
+    /return \{ result, archiveMs, txnMs: Date\.now\(\) - txnStartedAt \}/.test(src),
+    'commit() 必须回传真实事务耗时，而不是只回传 result',
+  );
+});

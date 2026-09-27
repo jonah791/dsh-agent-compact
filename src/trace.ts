@@ -86,8 +86,19 @@ export interface TraceEntry {
   queueSeq?: number
   /** 表层事件 seq 列表（`user/message`）。 */
   surfaceSeqs?: number[]
-  /** 已等待毫秒数（waited / abort）。 */
+  /** 已等待毫秒数（历史字段：0.1.x 投递链的等待时长；标记路径不等任何人）。 */
   waitedMs?: number
+  /** 压缩前存档耗时 ms——`committed` 行的阶段分解之一（保命网，可失败）。 */
+  archiveMs?: number
+  /** 表层替换事务耗时 ms（含两次全表 token 计量）——`committed` 行的阶段分解之一。 */
+  txnMs?: number
+  /**
+   * 本笔端到端耗时 ms（`detected` → `committed`）。
+   *
+   * 2026-09-27 线上首笔实测：`totalMs ≈ 21.9s`，而 `waitedMs` 恒 0——两者之间的
+   * 差额原先无法归因（硬编码占位让侧车说不出话）。现按阶段分解，回答 §5.22 五问之⑤。
+   */
+  totalMs?: number
   /** 捕获到的 checkpoint 字符数（captured）。 */
   chars?: number
   /** 捕获文本是否含 `<compacted-summary>` 标记（captured）。 */
@@ -152,6 +163,9 @@ export function serializeTraceEntry(entry: TraceEntry): string {
     ...(entry.queueSeq !== undefined ? { queueSeq: entry.queueSeq } : {}),
     ...(entry.surfaceSeqs !== undefined ? { surfaceSeqs: entry.surfaceSeqs } : {}),
     ...(entry.waitedMs !== undefined ? { waitedMs: entry.waitedMs } : {}),
+    ...(entry.archiveMs !== undefined ? { archiveMs: entry.archiveMs } : {}),
+    ...(entry.txnMs !== undefined ? { txnMs: entry.txnMs } : {}),
+    ...(entry.totalMs !== undefined ? { totalMs: entry.totalMs } : {}),
     ...(entry.chars !== undefined ? { chars: entry.chars } : {}),
     ...(entry.markerOk !== undefined ? { markerOk: entry.markerOk } : {}),
     ...(entry.session !== undefined ? { session: entry.session } : {}),

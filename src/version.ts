@@ -24,4 +24,4 @@
  */
 
 /** 本插件版本（与 `package.json` 的 `version` 必须一致，测试守门）。 */
-export const VERSION = '0.2.0'
+export const VERSION = '0.2.1'
