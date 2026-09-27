@@ -1,6 +1,6 @@
 # 语义文档：标记驱动压缩引擎（Marker-Driven Compaction Engine）
 
-> 版本 v0.2.1 · 2026-09-27 · 作者：爱丽丝 · 状态：**已实现（线上首笔压缩已验收；A12 待验）**
+> 版本 v0.2.1 · 2026-09-27 · 作者：爱丽丝 · 状态：**已实现（A1–A14 全部线上/离线已实测）**
 > 主人指令：「重新设计压缩插件，围绕智能体自主压缩」（2026-09-27）
 > 开发方式：语义文档优先（先写清「是什么/什么关系/怎么裁决」，再让实现逼近，最后用实践回修）
 > 实现落点：`self-plugins/dsh-agent-compact/src/{index,checkpoint-block,marker,region,config,trace}.ts`
@@ -9,6 +9,7 @@
 > 的现状与继承下来的判据。
 > ✅ 线上首笔（2026-09-27 11:26，本会话）已实测通过：`detected → committed`、上下文
 > 344,734 → 86,905 tok、标记消息与事务之间零额外请求（§9 有完整读数）。
+> ✅ 失败路径同日实测（A12 尸体探针）：短块 → 侧车 `rejected` + **同回合下一个 step** 的可见告知。
 
 ---
 
@@ -189,10 +190,10 @@ shadowedTokenCount, provider, model}` → `user/message{surfaceOp:{op,startSeq,e
 | A6 | 区间终点 = 标记消息前一个节点（标记消息不被吞） | 单测 `marker.test.mjs` | 已实测 |
 | A7 | 幂等：处理后 markerSeq < `compaction/end` seq | 单测 `marker.test.mjs` | 已实测 |
 | A8 | 事务事件序列与官方字节兼容 + 属主回合正确 | 既有 `tests/owner-turn.test.mjs`、`compact-range.test.mjs`（真 Session + 真事务） | 已实测 |
-| A9 | 组合装载成功（新 config schema + 新构建） | `preflight_check` full 通过；`compaction-trace.jsonl` boot 行 `0.2.0@1790479147323` | 已实测 |
+| A9 | 组合装载成功（新 config schema + 新构建） | `preflight_check` full 通过；boot 行 `0.2.0@1790479147323` 与 `0.2.1@1790480058993`（后者 live 58 / 需重启 0） | 已实测 |
 | A10 | **线上真实压缩一笔**：块 → `detected` → `committed`，上下文显著缩小 | 2026-09-27 11:26 本会话实压：侧车 `detected`(seqFloor=745, chars=5041) → `committed`(shadowed 364 nodes, seqs 8-744, txnMs≈21890)；`context_health` 344,734 → 86,905 tok（−74.8%） | 已实测 |
 | A11 | 零额外请求：压缩轮不产生额外的全上下文请求 | 事件流 seq745（标记）→ seq748（`compaction/start`）之间**零** `request/header`、零 `assistant/message`；压缩后首个请求在 seq760；存档 `createdAt` 与 `detected` 同秒（24 ms 级） | 已实测 |
-| A12 | 非法块在下个 step 可见（告知真的注入） | 待一次真实误写 | **待线上验收** |
+| A12 | 非法块在下个 step 可见（告知真的注入） | 2026-09-27 尸体探针（故意写 118 字符短块）：侧车 `rejected`(chars=118, error 具体) **且同回合下一个 step 就收到可见告知**——含「未生效 / 历史未改动 / 原因 / 怎么修」四段 | 已实测 |
 | A13 | 识别**只读文本块**：推理块与流式副本里的哨兵不参与判定 | 线上实证：标记消息事件含 **6 个**哨兵（`content[0]` reasoning 2 个 + `content[1]` text 1 个 + `stream` 镜像 3 个），仍判合法并压缩成功 | 已实测 |
 | A14 | 区间端点正确：标记消息**自身不被吞** | 线上实证：`seqFloor=745` 即标记消息 seq，被遮蔽区间为 `8-744`——端点取「标记消息之前一个表层节点」 | 已实测 |
 
@@ -202,8 +203,8 @@ shadowedTokenCount, provider, model}` → `user/message{surfaceOp:{op,startSeq,e
   （识别与包装，纯函数）、`src/marker.ts`（区间与幂等，纯函数）、`src/region.ts`（表层事务，
   继承 0.1.x，仅改「摘要入参为 thunk」）、`src/config.ts`、`src/trace.ts`
 - 同语义副本：无（本仓为主副本）；消费方契约见 `dsh-compact-provider/docs/semantic.md`
-- 未实现/未验证部分**显式标注**：A12（非法块告知）待一次真实误写；U1 的「回合间」时序已实测
-  （2026-09-27 首笔即回合间：`compaction/start` 落在 `turn/end` 之后、下一 `turn/start` 之前），
+- 未实现/未验证部分**显式标注**：A1–A14 **全部已实测**（2026-09-27）；U1 的「回合间」时序已实测
+  （首笔即回合间：`compaction/start` 落在 `turn/end` 之后、下一 `turn/start` 之前），
   「回合内」时序待一笔；U5（22 秒的去向）待带阶段计时的下一笔实测确认
 
 ## 9 · 实践修订记录
@@ -252,6 +253,13 @@ shadowedTokenCount, provider, model}` → `user/message{surfaceOp:{op,startSeq,e
   - **暴露的可维护性缺口（自指闭环的收获）**：本笔 `committed` 行只有硬编码 `waitedMs: 0`，
     答不出「21.9 秒花在哪」——当场补 `archiveMs`/`txnMs`/`totalMs` 三字段并配尸体测试
     （v0.2.1）；根因候选记 U5。**验收不只是确认设计对，也包括让机制说出自己的代价。**
+  - **失败路径同日验收（A12，v0.2.1 上线后）**：做了一次**明确标注的尸体探针**——故意写 118 字符
+    的短块。结果双侧齐备：侧车 `rejected`(chars=118, error「正文 118 字符 < 下限 200（碎片拒收）」)
+    ＋ **同一回合的下一个 step** 就收到可见告知（四段：未生效 / 历史未改动 / 原因 / 怎么修）。
+    比设计预期更快——`next-step` 投递在**回合内**就生效，不必等下一轮。**失败不静默**因此有了
+    可证伪的现场证据，而不是「实现里写了」的声明。
+  - **接地副作用（同批）**：0.2.1 重启后第一次 `edit` 撞了编辑守卫（`file has not been read`）
+    ——**重启会重置文件观测**，这条既是纪律也是实测（先 re-read 再改，不盲目重试）。
 
 ## 10 · 未决问题
 
