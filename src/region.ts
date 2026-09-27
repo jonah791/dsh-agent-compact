@@ -17,16 +17,48 @@ import {
 import type { CompactionResult } from '@deepseek-ai/dsh-compaction'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
 import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
-import type { Message, UserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, Message, TokenUsage, ToolSchema, UserMessage } from '@deepseek-ai/dsh-llm'
 import type { TokenMeasurement, TokenMeter } from '@deepseek-ai/dsh-token-meter'
 import type { Session, SessionEvent, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { frameSummary } from './summarizer.ts'
-import type { SummarizationInput, SummaryResult } from './summarizer.ts'
+import { frameSummary } from './checkpoint-block.ts'
+
+/**
+ * 供摘要器重放的会话前缀（system + 工具面 + 区间消息）。
+ *
+ * 只有**真要用 replay 载荷**的摘要器才需要它——标记驱动路径由 agent 自己供给摘要，
+ * 这个结构根本不会被构建（见 {@link RegionDependencies.summarize} 的 thunk 入参）。
+ */
+export interface SummarizationInput {
+  /** 会话自己的 system prompt（对齐前缀缓存）；无 system 时缺省。 */
+  readonly system?: string
+  /** 会话自己的工具 schema；请求未携带时缺省。 */
+  readonly tools?: readonly ToolSchema[]
+  /** 被遮蔽区间，按表层顺序，位于摘要指令之前。 */
+  readonly messages: readonly Message[]
+}
+
+/** 摘要正文 + 记账所需的调用信封（provider/model/用量）。 */
+export type SummaryResult = {
+  summary: ContentBlock[]
+  provider: string
+  model: string
+  maxTokens?: number
+  /** 该次摘要请求的 provider 用量。 */
+  usage?: TokenUsage
+  /** 完整原始输出（未做纯文本投影前）。 */
+  rawOutput?: ContentBlock[]
+}
 
 interface RegionDependencies {
   readonly meter: TokenMeter
-  summarize(input: SummarizationInput, agent: Agent, signal?: AbortSignal): Promise<SummaryResult>
+  /**
+   * 摘要来源。**入参是 thunk 而非已建好的输入**（2026-09-27 标记驱动重构）：
+   * 由 agent 自己供给摘要时（它刚把 checkpoint 写进输出），重建整段 replay 输入是
+   * 纯浪费——几十万 token 的会话要逐节点 `deriveEventMessage` 造一个没人读的数组。
+   * LLM 摘要器调用 `input()`；供给式摘要器永不调用。
+   */
+  summarize(input: () => SummarizationInput, agent: Agent, signal?: AbortSignal): Promise<SummaryResult>
 }
 
 /** One validated inclusive span of current surface positions. */
@@ -43,7 +75,8 @@ interface PreparedCompaction extends SurfaceSelection {
   readonly measurement: TokenMeasurement
   readonly selectedNodes: TokenMeasurement['nodes']
   readonly shadowedTokenCount: number
-  readonly input: SummarizationInput
+  /** 按需构建：只有真要用 replay 载荷的摘要器才调用它。 */
+  readonly input: () => SummarizationInput
 }
 
 type SummarizedCompaction = PreparedCompaction & SummaryResult & {
@@ -390,7 +423,7 @@ function prepareCompaction(
     measurement,
     selectedNodes,
     shadowedTokenCount: selectedNodes.reduce((total, node) => total + node.tokens, 0),
-    input: buildSummarizationInput(session, selection.shadowedSeqs),
+    input: () => buildSummarizationInput(session, selection.shadowedSeqs),
   }
 }
 
@@ -479,9 +512,7 @@ function commitCompactionBody(
     usage,
     checkpointMessage,
   } = summarized
-  const callProvenance = summarized.llmStreamCall === true
-    ? { rawOutput: summarized.rawOutput, llmStreamCall: true as const }
-    : summarized.rawOutput === undefined ? {} : { rawOutput: summarized.rawOutput }
+  const callProvenance = summarized.rawOutput === undefined ? {} : { rawOutput: summarized.rawOutput }
   const summaryEvent = session.append('compaction/summary', {
     compactionId: startEvent.data.compactionId,
     ...startEvent.data.sourceCommandId === undefined
@@ -580,8 +611,23 @@ function buildSummarizationInput(
   }
 }
 
-/** Inspect open-turn, unmatched-compaction, and latest seed-boundary state independently. */
-export function inspectCompactionEntryState(session: { seq: number; eventAt(seq: number): SessionEvent | undefined }): CompactionEntryState {
+/**
+ * 可压区间的起点 seq（surface 首个可被压缩的节点）。
+ *
+ * node 0 若持有 system prompt 则**永不进入压缩区间**（宿主 `assertSystemHeadRewrite`
+ * fail-loud；官方 `selectCompactableRange` 同款从 node 1 起）。标记驱动路径要「从
+ * 起点压到我的 checkpoint 消息之前」，需要这个起点；复制一份判断必然漂移，故导出。
+ * @param session - 供 surface 位置
+ * @returns 起点 seq；surface 为空时为 `undefined`
+ */
+export function compactableHeadSeq(session: Session): SessionSeq | undefined {
+  const nodes = session.surface.nodes
+  const headSeq = nodes[0]
+  const firstIdx = headSeq === undefined || systemHead(session, headSeq) === undefined ? 0 : 1
+  return nodes[firstIdx]
+}
+
+/** Inspect open-turn, unmatched-compaction, and latest seed-boundary state independently. */export function inspectCompactionEntryState(session: { seq: number; eventAt(seq: number): SessionEvent | undefined }): CompactionEntryState {
   let openTurn: number | null = null
   let openTurnStateKnown = false
   let unmatchedCompactionStart: SessionEvent<'compaction/start'> | undefined

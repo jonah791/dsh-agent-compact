@@ -1,214 +1,235 @@
-# 语义文档：智能体驱动压缩引擎（Agent-Driven Compaction Engine）
+# 语义文档：标记驱动压缩引擎（Marker-Driven Compaction Engine）
 
-> ⚠ **0.1.4 已回退（2026-09-14，主人「回退压缩插件版本」）**：有界重发（`nextInstructionAttempt` / `MAX_INSTRUCTION_ATTEMPTS`）**已从构建中撤下**，代码保留在 git `ed4b4e0`；当前行为 = 0.1.3（单次投递 + 8 秒表层轮询重查）。撤下原因：入口侧（`dsh-compact-provider` 0.3.x 直触）一并回退，先恢复被验证可用的组合（engine 0.1.3 + provider 0.2.0 = turn 71 那次成功压缩）。
-> 版本 v0.1.3（v0.1.4 已回退）· 2026-09-14 · 作者：爱丽丝 · 状态：**已实现**
+> 版本 v0.2.0 · 2026-09-27 · 作者：爱丽丝 · 状态：**已实现（待线上验收）**
+> 主人指令：「重新设计压缩插件，围绕智能体自主压缩」（2026-09-27）
 > 开发方式：语义文档优先（先写清「是什么/什么关系/怎么裁决」，再让实现逼近，最后用实践回修）
-> 实现落点：`self-plugins/dsh-agent-compact/src/{index,summarizer,region,config,types}.ts`
+> 实现落点：`self-plugins/dsh-agent-compact/src/{index,checkpoint-block,marker,region,config,trace}.ts`
+> ⚠ 0.1.x 的投递链设计（`agentSummarize` / 指令投递 / 表层取证 / 候选捕获）已**整体删除**；
+> 其完整文档与事故史见本文件 git 历史（`git log -p -- docs/semantic.md`）。本文只描述 0.2.0
+> 的现状与继承下来的判据。
 
 ---
 
 ## 1 · 定位与反定位
 
-**定位**：把「压缩」实现为**智能体自己的下一轮输出**——引擎把总结指令投给 owner agent，agent 在**暖 KV 前缀**上产出 `<compacted-summary>` checkpoint，引擎据此替换会话表层；事件序列与官方 `compaction-basic` **字节兼容**（日志可互换）。
+**定位**：把「压缩」实现为**智能体输出的一部分**。agent 在自己任意一轮的回复里写一个
+**合法 checkpoint 块**；引擎旁路观察会话事件流，看到它就把**该消息之前**的历史替换成这份摘要。
+摘要不需要被「要求」——它本来就是 agent 的下一段输出。
+
+**一句话判据**：**压缩 = agent 说压就压；引擎是被动的手，不是发令的人。**
 
 **反定位（本文不管什么）**：
-- 不管「何时该压」的决策——那属于 `dsh-compact-provider` 的入口（工具 / 直触）与**爱丽丝的常设授权**
-- 不管提醒——【上下文提醒】/【压缩告警】属于 `dsh-agent-context`；压缩提醒（先炼化再压缩）属于 `dsh-agent-skill-forge`
-- **不是** `auto` 自动压缩：本部署 `auto: false`（主人 2026-08-16「不要开自动压缩，别让框架强制影响你的决策」）。`auto: true` 时走的是 `agent/pre-step` 压力 + `agent/request-error` 溢出两条**官方 replay 摘要器**路径，与 agent 驱动是两条成本不同的路（replay = 独立请求全量载荷、无暖缓存；agent 驱动 = 自己的下一笔请求，实测 562,944/566,783 为 cacheRead）
+- 不管「何时该压」的判断——那是 agent 的自主决策（提醒信号来自 `dsh-agent-context`，
+  采用与否归 agent）
+- 不管「agent 怎么想起来要压」——开启一轮的原语（自我感知圈 / 任务板 / 主人消息）不属于本插件
+- **不是自动压缩**：`compactIfNeeded` 恒返回 `null`，引擎不注册任何 pressure / overflow 监听。
+  主人 2026-08-16 定调「不要开自动压缩，别让框架强制影响你的决策」（AGENTS.md §2.4）
+- **不是投递式压缩**：不存在「引擎要 agent 去总结」这条路径
+
+**与 0.1.x 的关系**：不是改进，是**删除**。0.1.x 的四段链——① 引擎 `agent.send` 投递总结指令
+② 等总结轮收口 ③ 表层取证「指令真的被模型看见」④ 在候选里按标记/长度猜哪条是 checkpoint——
+**全部不复存在**。三次历史事故（入队未进表层 / 指令被重试吃掉 / 重启后孤儿 checkpoint）都长在
+这条链上；它们不是被修好，是被删掉。
 
 ## 2 · 术语表
 
 | 术语 | 含义 |
 |------|------|
-| 意图请求 | 为在轮内调用入口而先发生的正常轮请求（实测 563,054 tok；`dsh-compact-provider` 直触可省掉它） |
-| 摘要请求 | 模型看见全文并输出 checkpoint 的那笔请求（实测 566,783 tok = `compaction/summary.usage.totalTokens`） |
-| 总结轮 | 指令投递后第一个出现 assistant 消息的 turn；捕获只取该轮的候选 |
-| 表层（surface） | 模型可见的持久对话面；`user/message` 事件是**指令真的被看见**的唯一证据 |
-| 捕获漂移 | 取到「不是 checkpoint」的助手文本当摘要（2026-09-13：117 字符碎片替换数千 token 历史） |
-| shadowedRange | 被替换掉的表层区间 `{start,end}`；`shadowedSeqs` 是被遮蔽的节点 seq 列表 |
-| 换血（replace） | 表层操作 `{op:'replace', startSeq, endSeq}`——**必须恰好三键**（多键被 append 处 fail-loud 拒绝） |
+| **checkpoint 块** | agent 输出里的一段结构化摘要：哨兵行 + `<compacted-summary>` 外壳 + 8 个 section 正文 |
+| **哨兵** | `<!-- alice-compact -->`——**显式压缩意图**的唯一标记。没有它就不是意图（`absent`） |
+| **标记消息** | 承载 checkpoint 块的那条 `assistant/message` |
+| **可压区间** | `[可压起点, 标记消息的前一个表层节点]`——**标记消息不在区间内** |
+| **可压起点** | surface 首个可压节点（node 0 若持 system prompt 则从 node 1 起，与官方同款） |
+| **替换体** | 合成的 `compactCheckpointSource` 用户消息（前言 + 外壳 + 摘要正文） |
+| **保命存档** | 提交前 best-effort 调 `checkpoint.create`（失败只 warn，不拦压缩） |
+| **供给式摘要** | 摘要由调用方给出（agent 自己的输出或工具参数），引擎不调 LLM、不建 replay 载荷 |
 
 ## 3 · 概念模型
 
 ```
-入口（provider 的工具 / 直触）
-   └─ compactNow(agent, signal, sourceCommandId)
-        ├─ 选可压区间 selectCompactableRange → 无 → 直接返回
-        ├─ 开启事务：compaction/start{compactionId, sourceCommandId, turn}
-        ├─ agentSummarize(agent)
-        │    ├─ 投递指令 agent.send(指令, 'next-turn', true)   ← 空闲会话由此自起总结轮
-        │    ├─ waitSummaryTurn（等总结轮收口；封口即算完，不白等 120s）
-        │    ├─ 表层取证 instructionSurfaced（user/message 含指令前 60 字符）
-        │    │    └─ 未取证 → 有界重发（≤2 次）→ 仍无 → 抛错（fail loud）
-        │    ├─ 选候选 selectSummaryCandidate（优先含 <compacted-summary> 块，否则最长）
-        │    └─ 碎片拒收：< MIN_PLAUSIBLE_SUMMARY_CHARS(200) → 抛错，绝不替换历史
-        ├─ 写 compaction/summary{summary, rawOutput, shadowedRange, shadowedSeqs, shadowedTokenCount, provider, model, usage}
-        ├─ 注入承接消息（source={plugin:'compact', compactionId, sourceCommandId}）+ replace 表层
-        ├─ compaction/end{compactionId, sourceCommandId, turn[, error]}
-        └─ sessions.flush
+标记路径（主路径，零额外请求）
+  agent 在任意一轮输出里写 checkpoint 块
+     └─ ctx.on('session/event', 'assistant/message')
+          ├─ 快筛：文本块不含哨兵 → 返回（绝大多数消息到此为止）
+          ├─ parseCheckpointBlock（纯函数，五层护栏）
+          │    absent  → 返回（不是意图）
+          │    invalid → 侧车 rejected + 注入可见告知（**写坏了必须响**）
+          │    valid   → setImmediate（避开 append 内 reenter）
+          └─ handleMarker
+               ├─ 幂等：markerSeq < 最近一次 compaction/end seq → skipped
+               ├─ 属主：ctx.agents.get(session.id) 拿不到 → skipped（不猜）
+               ├─ 区间：selectMarkerSpan(surface, markerSeq, headSeq)
+               └─ commit：保命存档 → compactSurfaceRegion（供给式摘要）→ flush
+
+工具路径（显式入口，同一个事务）
+  session_compact({summary, reason}) → engine.compactWithSummary(agent, summary)
 ```
 
 不变量（invariants）：
-1. **I1 无表层证据不捕获**：拿不到 `user/message` 里的指令痕迹 → 拒绝捕获并留 `compaction/end.error`（宁可压不成，不可压成错的）
-2. **I2 一次事务一条摘要路径**：不得同时跑 agent 与 replay 两条 summarize（2026-09-13 双投递根因）
-3. **I3 换血 op 恰好三键**：`{op,startSeq,endSeq}`
-4. **I4 busy 会话不阻塞**：`compactNow` 在会话忙时把指令排入 inbox 并**立即返回**，事务在后台完成（错误只落 logger + `compaction/end.error`）
-5. **I5 捕获必须按判据选**：一个 turn 可有多条 assistant 消息，选「含标记块 / 最长」，不选「最后一条」
-6. **I6 重发有界**：投递尝试 ≤ `MAX_INSTRUCTION_ATTEMPTS(2)`
+1. **I1 无哨兵不压缩**：没有哨兵一律 `absent`——文档、讨论、模板引用永不触发
+2. **I2 标记消息不被吞**：区间终点是标记消息**之前**的节点 ⇒ 它可以带工具调用、带寒暄、
+   带任务产出而不丢内容（**机制保证，不靠纪律**）
+3. **I3 幂等靠事件流**：已处理的标记消息 seq 必然小于此后写入的 `compaction/end` seq ⇒
+   重启重扫不会二次压缩（不额外落盘状态）
+4. **I4 一次事务一条摘要**：本引擎不存在第二条 summarize 路径（投递链已删）
+5. **I5 换血 op 恰好三键**：`{op,startSeq,endSeq}`（沿用，宿主 append 处 fail-loud）
+6. **I6 属主回合 = 提交那一刻的 openTurn**：`start→summary→end` 同一 tick 连续落盘，
+   满足 0.1.7 读侧硬判据（`compaction/start` 的 turn 必须等于当时开着的回合）
+7. **I7 无自动路径**：`compactIfNeeded` 恒 `null`；`compactNow` / `compactRegion` 明确抛错
+8. **I8 失败必响**：非法块与事务失败都落侧车轨迹 + 注入一条可见告知（`next-step`，不唤醒）
+9. **I9 观测绝不反噬**：轨迹/告知一律吞错返回，绝不破坏压缩或会话主流程
 
 ## 4 · 契约
 
-### 4.1 配置（`AgentCompactEngine.Config`，由 provider 复用）
-- `thresholdRatio` / `retainRatio` / `retainTokens`：自动压力路径的阈值与保留量
-- `summarizationProvider` / `summarizationModel` / `maxTokens`：**replay** 摘要器的目标与上限
-- `compactionRetries` / `maxOverflowRetries`：重试预算（溢出恢复默认 1）
-- `modelPolicies`：按 provider/model 的覆盖
-- `auto`：是否登记 `agent/pre-step` 压力与 `agent/request-error` 溢出两条**官方 replay** 路径——**本部署 false**
+### 4.1 配置（`CompactConfig`，`src/config.ts`）
+- `enabled`（默认 `true`）：是否启用标记路径
+- `minCheckpointChars`（默认 `200`）：合法正文长度地板
+- **旧策略字段全部删除**：`auto` / `thresholdRatio` / `retainRatio` / `retainTokens` /
+  `modelPolicies` / `summarizationProvider` / `summarizationModel` / `maxTokens` /
+  `compactionRetries` / `maxOverflowRetries`。⚠ 组合里若残留旧键会**装载失败**（fail loud）
 
-### 4.2 事件序列（事务的持久形状）
-`compaction/start` → `agent/inbox/spliced{inserted}`（入队）→ `agent/inbox/spliced{removedCount}`（被某一步消费）→ `user/message`（表层落地；**时机不固定**，可能在下个 turn 边界）→ `compaction/summary` → `user/message`（replace 换血）→ `compaction/end`（携带 `error` 即失败）
+### 4.2 checkpoint 块的合法形态（五层护栏，全部满足）
+```markdown
+<!-- alice-compact -->
+<compacted-summary>
+## Primary Request and Intent
+- …
+## Key Technical Concepts
+- …
+## Files and Code
+- …
+## Errors and Fixes
+- …
+## Pending Jobs
+- …
+## Current Work
+- …
+## Next Step
+- …
+## Critical Context
+- …
+</compacted-summary>
+```
+| # | 护栏 | 拦住的形状 |
+|---|------|-----------|
+| 1 | 恰有一行以哨兵开头（行首，允许前导空白） | 无哨兵（引用模板）/ 多哨兵（意图不明） |
+| 2 | 哨兵不在围栏代码块内 | 「贴一段规范形态讲给人听」 |
+| 3 | 哨兵后紧跟 `<compacted-summary>`，且有配对闭标签 | 半截块 |
+| 4 | 正文 ≥ `minCheckpointChars` | 108 字符碎片（2026-09-26 真实事故形状） |
+| 5 | 正文**按序**含全部 8 个 section | 少节 / 乱序 / 单节复读 |
 
-### 4.3 裁决（纯函数优先）
-- `textOfEventData(data) → string`：**形状宽容**取文本（`content` / `message.content` / `inserted[].content`）——初版只认一种形状 ⇒ 闸门 100% 假拒绝（2026-09-14）
-- `instructionSurfaced(view, floor) → {surfaced, seqs}`：表层是否出现过指令（比对前 60 字符）
-- `nextInstructionAttempt({attempt, surfaced, maxAttempts}) → 'accept'|'resend'|'fail'`：投递失败后的动作（2026-09-14 二次事故：指令被消费它的那一步的请求吃掉、该请求随即 provider 重试 → 指令蒸发）
-- `selectSummaryCandidate(candidates) → {index, reason} | null`：优先含 `<compacted-summary>` 块者（取最长），否则取最长文本；附裁决理由（写日志）
+**首要误触发面已被结构性排除**：识别只读助手消息的**文本块**，工具调用参数永不进入判定 ⇒
+写文件、写技能、写语义文档（含 `formatCheckpointBlock()` 产物）**不可能**触发压缩。
+
+### 4.3 事件序列（事务的持久形状，与官方字节兼容）
+`compaction/start{turn}` → `compaction/summary{summary, rawOutput, shadowedRange, shadowedSeqs,
+shadowedTokenCount, provider, model}` → `user/message{surfaceOp:{op,startSeq,endSeq}}` →
+`compaction/end`。失败发生在 start 之前 ⇒ **不写任何事件**（绝不留下未闭合的 start）。
 
 ### 4.4 调用点清单 `[MUST]`
 
 | 调用方 | 调用点（文件:符号） | 时机 |
 |-------|------------------|------|
-| `dsh-compact-provider` | `src/index.ts` → `compaction.compactNow(...)` | `session_compact` 工具 / 直触（pre-step、turn/end） |
-| 引擎自身（真机自测） | `src/index.ts:_registerAutomaticCompaction` | 仅 `auto:true`：`agent/pre-step`（压力）、`agent/request-error`（溢出） |
-| 引擎自身 | `src/index.ts:compactNow` | `inspectCompactionEntryState` 定 owner：空闲=同步执行；忙=排队 + 立即返回 |
+| 宿主事件 | `src/index.ts:registerMarkerPath` → `ctx.on('session/event')` | 每条 `assistant/message` 落盘后 |
+| 工具面 | `dsh-compact-provider:src/index.ts` → `engine.compactWithSummary` | `session_compact` 被调用 |
+| 引擎自身 | `src/index.ts:commit` → `compactSurfaceRegion` | 两条入口共用的唯一事务 |
+| 宿主 seam | `src/index.ts:compactIfNeeded` | 恒 `null`（无自动路径）；`compactNow`/`compactRegion` 恒抛 |
 
-### 4.5 侧车轨迹 `[MUST]`（`src/trace.ts` · 2026-09-14 补记，此前遗漏文档回修）
+### 4.5 侧车轨迹 `[MUST]`（`<DSH_HOME>/compaction-trace.jsonl`）
 
-**问题**：本插件只把过程写进 `ctx.logger`，而宿主 logger **不落盘** ⇒「谁发的指令 / 投给谁 / 落地没 / 断在哪一段 / 线上跑的是哪个构建」只能靠外部现场写解析脚本反解会话事件流（一次排障写了四段一次性代码）。
+| `side` | 阶段 | 含义 |
+|--------|------|------|
+| 缺省（引擎） | `boot` | 进程加载自报：版本 + inject + 路径 + `auto=none` |
+| 缺省 | `detected` | 识别到合法块（带 `seqFloor` / `chars` / `agentId`） |
+| 缺省 | `committed` | 表层已换血（`note` 含遮蔽节点数与 seq 区间） |
+| 缺省 | `skipped` | 是意图但没压（幂等 / 无可压区间 / 拿不到 agent），`note` 给理由 |
+| 缺省 | `rejected` | **有哨兵但不合法**——写坏了（`error` 给具体护栏） |
+| 缺省 | `abort` | 事务抛错（`error` 给原因） |
+| `provider` | `requested`/`rejected`/`completed`/`failed` | 工具入口侧四阶段 |
 
-**契约**：`<DSH_HOME>/compaction-trace.jsonl`，一行一阶段，`atMs` 单调。**两个写者共用一个文件**（按 `atMs` join 成一笔事务）：
-
-| 写者 | `side` | 阶段 |
-|------|--------|------|
-| 引擎（本插件） | 缺省（向后兼容旧行） | `boot` / `begin` / `queued` / `waited` / `surfaced` / `captured` / `abort` |
-| 入口（`dsh-compact-provider`） | `'provider'` | `requested` / `rejected` / `completed` / `failed` |
-
-**断点即最后一条非 `abort` 阶段**；事务失败必写 `abort`（带 `error` 与已等毫秒数）。
-
-**`trigger` 字段（2026-09-23 补 · v0.1.4）**：自动路径原先**零轨迹**（三处失败只写 `ctx.logger.warn`，而宿主 logger 不落盘）⇒ 写坏会话后无法回答「哪条路径写的」。现四条路径都在调用点记账：
-
-| `trigger` | 触发者 | 落账阶段 |
-|-----------|--------|---------|
-| `step-pressure` | `agent/pre-step` 步间压力 | `captured` / `abort`（配置类错误按 targetKey 只落一次） |
-| `context-overflow` | `agent/request-error` 请求溢出恢复 | `captured` / `abort`（带 `note: durable-surface-progress` 区分「已有表层进展」） |
-| `manual-idle` | `compactNow` 空闲会话（同步等结果） | `captured` / `abort` |
-| `manual-busy` | `compactNow` 忙会话（fire-and-forget） | `captured` / `abort` |
-
-不落 `begin`：自动路径每次 pre-step 都会试压，未越阈值即返回 `null`——为「没压」记账只会淹没轨迹。**「有没有压、压没压成、断在哪」由 `captured`/`abort` 回答**。
-
-**`session` 字段的区分力（2026-09-23 修正）**：原实现取 `id.slice(0,8)`，而真实 id 形如 `session-9919ca78-…` ⇒ 每个会话都得到同一个 `session-`（字段在假装提供信息）。现剥掉通用前缀后取 8 位（`9919ca78`）。本日之前的轨迹行该字段无信息量，读侧不必兼容。
-
-导出的原语（`src/trace.ts`，并被主入口**转出**供 provider 复用）：
-`resolveHome()`（`DSH_HOME` → `homedir()/.dsh`）、`compactionTracePath()`、`serializeTraceEntry()`（稳定键序单行 JSON）、`parseTraceEntries()`（坏行跳过不抛）、`readTraceEntries()`、`sessionTagOf()`（**2026-09-23 新增**：剥 `session-` 前缀取 8 位，单一真源）、`buildStamp()`（`<version>@<模块 mtime ms>`）、`BUILD`、`appendTraceEntry()`（失败即吞返回 `false`）、`trace()`。
-
-> **`buildStamp` 的版本段（2026-09-23 修正）**：原先从模块旁的 `package.json` 读版本，而消费方以 `file:` 依赖安装时 pnpm 会**复制并重写** `package.json`（快照），只有 `lib/*.js` 是硬链接 ⇒ 实测同一个构建里**代码新、版本旧**（轨迹写着 `0.1.0@1790131527923`，而该 mtime 正是新产物的 mtime）。现版本段取自随源码走的 `VERSION` 常量（`src/version.ts`，产物同为硬链接）——`package.json` 降级为回退来源，两者一致性由测试守门。**mtime 是真源，版本段现在也真了。**
-
-不变量：
-- **I9 判据单一真源**：消费方**必须**经主入口转出复用本模块（`import { compactTrace } from 'dsh-agent-compact'`），**不得**自建第二套路径解析/序列化。
-- **I10 观测绝不反噬**：`appendTraceEntry`/`trace` 吞错返回 `bool`，调用方一律忽略返回值——写不进去绝不破坏压缩主流程。
-- **I11 不得经 `package.json` 子路径导出**：消费方副本的 `package.json` 由 pnpm 重写，新增子路径导出不会同步（2026-09-14 实测 `./trace` 匹配 = False）⇒ `ERR_PACKAGE_PATH_NOT_EXPORTED` 会让 provider 装载失败 = 压缩整体不可用。主入口 `./lib/index.js` 是硬链接（改动即时可见，实测哈希一致）。
-- **I12 轨迹不得成为模型可见输入**（本地产物，非会话事件）。
+**断点即最后一条非终态阶段**。`build` 字段自证「线上跑的是哪个构建」（版本段取自随源码走的
+`VERSION` 常量，不信消费方副本的陈旧 `package.json`）。
 
 ## 5 · 边界与信任
 
-- **能力边界 ≠ 沙箱**：本引擎不做「该不该压」的价值判断，也不拦恶意调用（调用方是自有 provider）
-- 不越界清单：不改写 system 节点（`node 0 holds the system prompt…` 会 fail loud）；不在 `auto:false` 时自行触发；不删除事件（只做表层替换）
-- 失败面：① 投递失败 → 有界重发 → 仍失败则 `compaction/end.error`（**响**）② 捕获可疑（无表层证据 / 碎片）→ 拒绝捕获（**响**）③ 换血 op 非法 → 宿主 append 处 fail-loud 拒绝（**响**）——三处都**不静默**
+- **能力边界 ≠ 沙箱**：本引擎不判断「该不该压」，也不拦恶意调用（调用方是自有插件）
+- **哨兵的信任语义**：能写进 agent 输出 = 能压缩。这是**设计意图**（agent 是唯一决策者），
+  不是漏洞；但因此**识别必须严**——误判一次就改写历史（见 §7 的尸体样本）
+- 不越界清单：不改写 system 节点（`compactableHeadSeq` 从 node 1 起）；不删除事件（只做表层替换）；
+  不在无哨兵时自行触发；不调 LLM（供给式摘要）
+- 失败面：① 拿不到 agent → `skipped` ② 无可压区间 → `skipped` ③ 非法块 → `rejected` + 告知
+  ④ 事务抛错 → `abort` + 告知 ⑤ 摘要不小于被遮蔽内容 → 事务内 fail loud（不替换）——
+  **五处都不静默**
 
 ## 6 · 与既有机制的关系
 
-- AGENTS.md **§5.21**（压缩 checkpoint 纪律：独占一轮 / 压缩后查存档 / 真原文只在事件流）
-- AGENTS.md **§5.15**（事件契约：`compaction/summary` → `compaction/end.error` 是首要证据；换血 op 三键）
-- AGENTS.md **§4/§2.1**：压缩决策归爱丽丝，本引擎只提供「怎么压」的机械
-- 与 `dsh-compact-provider` 的分工：provider 管**入口与授权**，引擎管**事务与捕获**
+- AGENTS.md **§2.4 / §2.1**（禁止框架自动压缩 / 决策归爱丽丝）：本引擎**结构上**没有自动路径
+- AGENTS.md **§5.21**（压缩 checkpoint 纪律）：checkpoint 块的写法与「压缩后查存档」仍适用；
+  「独占一轮」不再是机制要求（I2 让它变成可选），但仍是**推荐**（可读性）
+- AGENTS.md **§5.22**（可维护性五问）：轨迹侧车一次 tail 答齐
+- 与 `dsh-compact-provider` 的分工：provider 管**挂载与工具入口**，引擎管**识别与事务**
+- 与 `dsh-agent-context` 的关系：它读 `compaction/end.error` 做失败守望——本引擎照旧写该字段
 
 ## 7 · 可证伪验收清单
 
 | # | 可证伪命题 | 证据 | 状态 |
 |---|-----------|------|------|
-| A1 | 指令未进表层 → 拒绝捕获且 `compaction/end.error` 可见 | 事件流 7952（`never reached the model-visible surface`） | 已实测 |
-| A2 | 表层落地晚于总结轮收口也能捕获（顺序不固定） | 事件流 8105/8106（表层 8105、摘要 8106） | 已实测 |
-| A3 | 碎片（<200 字符）必被拒收 | 单测 `instruction-surfaced.test.mjs` 回归样本 | 已实测 |
-| A4 | 重复形状（`data.content` / `data.message.content`）都判定为「已进表层」 | 单测 18/18 | 已实测 |
-| A5 | 一次事务只有一条摘要路径（无双投递） | `scripts/compaction-forensics.py` injections=1 | 已实测 |
-| A6 | 投递失败后有界重发（≤2 次）后仍无表层 → fail loud | 单测 `nextInstructionAttempt`（resend → fail） | 已实测（单测）/ **待线上验收**（真实重发） |
-| A7 | busy 会话 `compactNow` 立即返回、事务后台完成 | 事件流 8092→8108（同轮内完成） | 已实测 |
-| A8 | **属主回合 = 提交那一刻的 openTurn**：摘要期间回合结束，`start/summary/end` 仍落在**新**回合内（且三件套相邻无 `turn/*` 夹入） | 单测 `tests/owner-turn.test.mjs`（真实 harness Session + 真实 region 事务，summarize 桩在 await 内推进回合） | 已实测 |
-| A9 | 空闲会话的属主回合为 `null`（读侧接受，不伪造回合号） | 同上（第二例） | 已实测 |
-| A10 | 自动路径的失败必落侧车轨迹（`trigger` + `abort`），不再只进 `ctx.logger` | 源码接线（`traceAutomatic` × 4 处）+ 单测 `trigger` 字段 | 已实测（字段）/ **待线上验收**（真实自动压缩一笔） |
-| A11 | 构建标识的版本段取自源码（`VERSION`），不受消费方副本陈旧 `package.json` 影响 | 单测：`VERSION === package.json.version` + 源码级断言「不得出现 `'package.json'`」 | 已实测 |
-| A12 | 夹具不依赖运行平台（Windows `E:/…` 与 WSL `/mnt/e/…` 都能真跑，不再走 skip 假绿） | `pickRoot()`；实测 Windows `npm test` 32/32、WSL `node --test` 32/32，`skipped 0` | 已实测 |
+| A1 | 无哨兵的规范外壳 → `absent`，绝不压缩 | 单测 `checkpoint-block.test.mjs`（尸体样本） | 已实测 |
+| A2 | 围栏内的哨兵 → `invalid`（引用不是意图） | 同上 | 已实测 |
+| A3 | 少一节 / 乱序 → `invalid` 并列出缺哪节 | 同上 | 已实测 |
+| A4 | 108 字符碎片 → `invalid`（碎片拒收） | 同上（2026-09-26 事故形状复刻） | 已实测 |
+| A5 | 工具调用参数里的块**不进入判定** | 单测 `marker.test.mjs`（`assistantTextOf` 尸体样本） | 已实测 |
+| A6 | 区间终点 = 标记消息前一个节点（标记消息不被吞） | 单测 `marker.test.mjs` | 已实测 |
+| A7 | 幂等：处理后 markerSeq < `compaction/end` seq | 单测 `marker.test.mjs` | 已实测 |
+| A8 | 事务事件序列与官方字节兼容 + 属主回合正确 | 既有 `tests/owner-turn.test.mjs`、`compact-range.test.mjs`（真 Session + 真事务） | 已实测 |
+| A9 | 组合装载成功（新 config schema + 新构建） | `preflight_check` full 通过；`compaction-trace.jsonl` boot 行 `0.2.0@1790479147323` | 已实测 |
+| A10 | **线上真实压缩一笔**：块 → `detected` → `committed`，上下文显著缩小 | 待下一次真实压缩 | **待线上验收** |
+| A11 | 零额外请求：压缩轮不产生额外的全上下文请求 | 对比 `assistant/message.usage` 与压缩前后 `tokenMeter` | **待线上验收** |
+| A12 | 非法块在下个 step 可见（告知真的注入） | 待一次真实误写 | **待线上验收** |
 
 ## 8 · 与实现的关系
 
-- 主实现：`src/index.ts`（引擎类与注册）、`src/summarizer.ts`（指令文本 / 投递 / 取证 / 候选选择）、`src/region.ts`（区间选择、表层事务、`compaction/*` 写入）、`src/config.ts`（策略解析）、`src/types.ts`
-- 同语义副本：无（本仓库为主副本）；调用契约的消费方副本见 `dsh-compact-provider/docs/semantic.md`
-- 未实现/未验证部分**显式标注**：① `auto:true` 的两条 replay 路径在本部署**未启用**，其行为仅有单测与代码证据 ② 重发路径尚无真实失败样本（A6 待线上验收）
+- 主实现：`src/index.ts`（引擎类、标记路径注册、事务提交、告知）、`src/checkpoint-block.ts`
+  （识别与包装，纯函数）、`src/marker.ts`（区间与幂等，纯函数）、`src/region.ts`（表层事务，
+  继承 0.1.x，仅改「摘要入参为 thunk」）、`src/config.ts`、`src/trace.ts`
+- 同语义副本：无（本仓为主副本）；消费方契约见 `dsh-compact-provider/docs/semantic.md`
+- 未实现/未验证部分**显式标注**：A10/A11/A12 需一次真实压缩；`setImmediate` 提交在
+  「回合内 / 回合间」两种时序下的实测各需一笔
 
 ## 9 · 实践修订记录
 
-- **2026-09-23 0.1.7 契约适配 + 观测缺口闭合（v0.1.4）**
-  - **背景**：DSH 由 `0.1.6-alpha.2` 升到 `0.1.7-alpha.1`（会话格式 v3→v4）。读侧新增硬判据
-    `turn/end crosses an open compaction`（`session-format-v3-to-v4/src/relationships.ts:229-237/270-271`），
-    把「compaction 必须完整闭合在属主回合内」从**约定**变成**硬拒收**——**12 个会话因此打不开**。
-  - 语义**被修正（事故根因）**：旧实现先 append `compaction/start`（以入口时的 `openTurn` 当属主）
-    再 `await` 摘要（实测可达 120s）⇒ 回合在 await 内结束，`summary`/`end` 落进下一回合。
-    改为「**先摘要、后开事务**」：`start→summary→end` 同一 tick 连续落盘，属主回合 = **提交那一刻**
-    开着的回合（空闲则 `null`）。守卫见 A8/A9（`tests/owner-turn.test.mjs`，真实 Session + 真实事务）。
-  - 语义**被修正（失败可见性）**：start 之前失败不再留未闭合 `start`（那是读侧拒收的形状）⇒
-    旧设计依赖的「可检测的未闭合 start」消失。**补偿**：所有路径的失败必落侧车 `abort`
-    （原先自动路径三处失败只写 `ctx.logger.warn`，而宿主 logger **不落盘**）。
-  - 语义**被补充（观测覆盖）**：新增 `trigger` 字段（`step-pressure` / `context-overflow` /
-    `manual-idle` / `manual-busy`），自动路径首次有轨迹（A10）。动机是实测代价：修那 12 个会话时
-    无法回答「哪条路径写的 / 哪个构建写的 / 断在哪一阶段」。
-  - 语义**被修正（两个字段曾在假装提供信息）**：① `session` 恒为 `session-`（零区分力，取 id 前 8 位
-    撞上通用前缀）→ 剥前缀取 8 位；② `build` 的版本段恒为副本 `package.json` 的陈旧版本
-    （实测 `0.1.0@1790131527923`，而该 mtime 正是新产物）→ 改读随源码走的 `VERSION` 常量（A11）。
-  - 语义**被修正（测试假绿）**：夹具硬编码 `E:/…`，在 WSL 里 `existsSync` 恒 false ⇒ 走
-    `process.exit(0)` 的 skip 分支，而 `node --test` **记成 pass** ⇒ 三个断言（含尸体测试）
-    从未执行。加 `pickRoot()` 平台回退（A12）。**教训：`skipped 0` 必须是验收读数的一部分。**
-  - **未做 / 未决**：真实自动压缩的一笔线上验收（A10 后半）；`dsh-agent-teams` 的 client bundle
-    重建（0.1.7 升级遗留，与压缩路径无关但同批）。
+> 0.1.x 的完整事故史（2026-09-13 捕获漂移 / 09-14 闸门假拒绝与指令被重试吃掉 / 09-23 属主回合
+> 硬判据与两个「假装提供信息」的字段）见本文件 git 历史。
 
-- **2026-09-14 侧车轨迹 + 文档回修（可维护性补课）**
-  - 语义**被补充**：新增 §4.5——`src/trace.ts` 把事务过程落成 `<DSH_HOME>/compaction-trace.jsonl`（此前只写 `ctx.logger`，而宿主 logger **不落盘**）。**本文档此前遗漏了这次回修**（§5.20 I3 违规），本次补齐。
-  - 语义**被补充（两侧同文件）**：`TracePhase` 扩为两写者共用——引擎侧 `boot/begin/queued/waited/surfaced/captured/abort`，入口侧 `requested/rejected/completed/failed`（`side:'provider'` 区分）。入口侧四阶段由 `dsh-compact-provider` 调用本模块**转出**的原语写入（I9 判据单一真源）。
-  - 语义**被修正（事故预防·实测）**：**不得用 `package.json` 子路径导出**对外暴露 trace——消费方副本（`dsh-compact-provider/node_modules/.pnpm/…`）的 `package.json` 由 pnpm 重写，新增 `"./trace"` 导出**不会**同步过去（实测 `match` = False），届时 `ERR_PACKAGE_PATH_NOT_EXPORTED` 会让 provider 装载失败 = **压缩路径整体不可用**。改走主入口 `export { … } from './trace.ts'`（`lib/index.js` 是硬链接，实测与副本哈希一致）。
-  - 首次实测（2026-09-14）：轨迹全阶段落盘 `begin→queued→waited(24157ms)→surfaced(seq 10808)→captured(chars=13166, markerOk=true)`；上下文 504k → 72,524。**五问在一处答齐，无需再写取证脚本。**
-
-- **2026-09-13 首次实践（捕获缺陷）**
-  - 语义**被确认**：事务形状、表层替换、`compaction/end.error` 为唯一失败信号
-  - 语义**被补充**：捕获必须按判据选候选（标记块 / 最长），并加碎片拒收下限
-  - 语义**被修正**：「入队 = 投递」被证伪——`agent/inbox/spliced` 的 inserted/removedCount 是同一投递的两个生命周期事件；判据只能是**表层 `user/message`**
-  - 教训：真原文只在 append-only 事件流里（`<DSH_HOME>/sessions/…/session.v3.jsonl.zstd`）
-- **2026-09-14 二次实践（闸门假拒绝）**
-  - 语义**被修正**：事件形状必须**实测取证**——`instructionSurfaced` 初版只读 `data.message.content`，真实形状是 `data.content` ⇒ 恒 false ⇒ 第一次真实压缩被自己的闸门拦下（上下文卡在 512k）
-  - 语义**被补充**：表层落地时机不固定（可能在下个 turn 边界）⇒ 判定前必须短轮询（`SURFACE_WAIT_MS=8000` / `SURFACE_POLL_MS=500`）
-- **2026-09-14 三次实践（指令被重试吃掉 · v0.1.4）**
-  - 语义**被补充**：投递失败（入队后被某步消费、该步请求随即 `assistant/attempt`+`llm/retry` → 指令随重建请求蒸发）必须**有界重发**（≤2 次），不再一次判死
-  - 教训：判据（表层才算看见）与处置（没看见怎么办）要分开——判据不变，处置要有自愈
-
-- **2026-09-20 归一化核实（实践回修 · 自查触发）**
-  - 背景：主人指令「自检，本地的哪些插件需要重新设计」→ 用新写的生态审计器（`dsh-plugin-forge/scripts/audit-ecosystem.mjs`，判据与生成器同源）扫 58 个目录；本插件在**六条判据中前五条全过**（无依赖遮蔽 / 无内部路径导入 / `static inject` 声明与用法一致 / `tests/` 齐全 / 本语义文档存在），只差 Fabric manifest（前瞻项，Fabric 仍是 Draft）。
-  - 语义**被确认（并更正我的一次误判）**：我在给主人的报告里把本插件判为「移植件，需归一化」，依据仅是 `src/index.ts` 前 24 行的**英文头注释**。实际核查：README **有**中文生态公约声明头、本文档中文且含回退记录、`tests/` 四个文件齐全、`package.json` 里还有中文的 `_comment_typeResolution`（遮蔽纪律）⇒ **本插件早已归一化**；误判属「**局部读数当全局事实**」。
-  - 语义**被修正**：`package.json` 的 `description` 由英文改为中文——它决定 `plugin_list` 档案与 GUI 里显示的用途，是本插件唯一**对外可见**的语言不一致处。
-  - **明确不做**：把 Service 类形态（`static inject`）重构为函数插件形态。该形态是 cordis 合法写法且本插件用法与声明一致（`static inject = ['llm','tokenMeter','sessions']`）；而本插件是 `dsh-compact-provider` 的 **live 依赖**（`file:../dsh-agent-compact`），**无判据的重构只有回归风险**。
-  - 教训：**审计器报「无命中」时不要顺手加"归一化"判断**——判断项必须落到「哪一行、依据什么」才算数，否则会把风格差异说成缺陷。
-
-- **2026-09-22 行尾归一（D3 复核：判为 mtime 抖动，非语义漂移）**：本仓存量的 CRLF 工作区文件被强制重检出为 LF（`git add --renormalize .` 归一索引 + `rm && git checkout` 重写工作区），**触碰了 impl 落点的 mtime** ⇒ `semantic_check` 报 D3「实现比文档新」。实现内容一字未改（`git diff HEAD --stat` 为空即证）——触发量是行尾，不是语义。⇒ 归入 D3 的 mtime 抖动型误报，已在 `t-c54b41c6` / `t-9a4a045e` 记录。
+- **2026-09-27 重设计：投递链 → 标记驱动（v0.2.0）**
+  - **语义被推翻**：「压缩 = 引擎要 agent 总结，再把它的输出捕获为摘要」不成立。真语义是
+    「**agent 的输出本身就是压缩请求**」——摘要不需要被要求，它本来就是 agent 的下一段输出。
+  - **删除清单**（这才是重设计的实质）：`agentSummarize`、`AGENT_COMPACTION_INSTRUCTION`、
+    `waitSummaryTurn`、`SURFACE_WAIT_MS`/`SURFACE_POLL_MS`、`instructionSurfaced`、
+    `textOfEventData`、`selectSummaryCandidate`（猜候选）、`summarizeWithLlm`（replay 摘要）、
+    `_registerAutomaticCompaction`（自动路径）、`compactNow` 的手动语义、压力策略配置七项。
+  - **语义被补充**：识别从「猜哪条 assistant 消息是摘要」变成「**解析一个显式声明的块**」——
+    判定由统计式（标记/最长）变为解析式（五层护栏），误判面从「像 checkpoint」收紧到
+    「就是 checkpoint」。
+  - **语义被补充（承重设计选择）**：区间终点取**标记消息之前**的节点 ⇒ 标记消息可以带工具
+    调用、带寒暄、带任务产出。0.1.x 靠「checkpoint 独占一轮」的纪律保证正确，而纪律靠人守会
+    失败（三次事故的根因之一）；现在它是**机制保证**。
+  - **语义被补充（幂等）**：用事件流自身当状态（`markerSeq < 最近一次 compaction/end seq`），
+    不额外落盘——重启重扫不会二次压缩。
+  - **语义被补充（失败可见）**：非法块与事务失败都注入一条可见告知（`next-step`，不唤醒）。
+    0.1.x 的失败只落 logger（**不落盘**）或 `compaction/end.error`（要人去读）。
+  - **成本**：0.1.x 一次压缩 = 意图请求 + 摘要请求（实测 1,130,000 tok 量级）；现在**零额外
+    请求**——块寄生在本来就要发生的那一轮里。
+  - **实测读数（设计立项时的取证）**：40 个会话共 84 笔压缩起步 / 79 笔摘要（**6% 失败率**）；
+    最近一笔（2026-09-26）正是投递链的捕获漂移（108 字符碎片被地板拦下，**上下文毫发未缩**）。
+    官方 `compaction-basic`（auto:true，挂在会话预设 realm）**从未触发**（全部 84 笔都带
+    `alice-self-compact`）——顺手确认了「框架自动压缩」在实际运行中未发生。
 
 ## 10 · 未决问题
 
-- **U1** 重发上限是否该按「指令文本不变 + 表层层级」再收紧（当前 2 次，尚无真实重发样本）
-- **U2** `auto:false` 下 `agent/pre-step` 压力路径完全未启用——是否需要一个「只观测不压缩」的压力信号（供提醒插件复用），由 `dsh-agent-context` 裁决
-- **U3** 捕获后 `sessions.flush` 失败的补偿路径未定义（当前依赖宿主重放）
+- **U1** `setImmediate` 提交的两条时序（回合内 / 回合间）都需一次真实压缩的读数（A10）
+- **U2** 是否需要一个「压缩体检」工具（列最近 N 笔压缩的轨迹 + 结果）——当前靠 `tail` 侧车
+- **U3** 若某轮同时写了两个哨兵（意图不明）会被判 `invalid` 并告知；是否该支持「压最后一块」
+  （当前判：**不猜**，宁可让 agent 重写）
+- **U4** 预设 realm 里的官方 `compaction-basic`（auto:true）虽未观测到触发，但它的存在是
+  一个「潜在的第二个压缩者」——是否该显式关掉（需要改预设 realm，属组合变更）

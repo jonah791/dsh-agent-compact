@@ -92,7 +92,8 @@ test('appendTraceEntry：不可写路径返回 false 且不抛（观测不得反
 test('buildStamp：形如 <version>@<mtimeMs>，可从模块 URL 自证构建', () => {
   const stamp = buildStamp(import.meta.url);
   // mtimeMs 带小数部分（Node 返回毫秒浮点）——契约是「版本 + @ + 数字」，不是整数
-  assert.match(stamp, /^0\.1\.\d+@\d+(\.\d+)?$/);
+  // 版本段不锁具体号（锁了每次升版都要改测试）；真正的守卫是下面 startsWith(VERSION)
+  assert.match(stamp, /^\d+\.\d+\.\d+@\d+(\.\d+)?$/);
   assert.ok(
     stamp.startsWith(VERSION + '@'),
     '版本段必须来自随源码走的 VERSION 常量（副本里 package.json 是陈旧快照）',

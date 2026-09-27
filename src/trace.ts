@@ -25,14 +25,17 @@ import { fileURLToPath } from 'node:url'
 import { VERSION } from './version.ts'
 
 /**
- * 阶段枚举：一笔记账从 boot（进程级）到 captured / abort（事务级）。
+ * 阶段枚举：一笔记账从 boot（进程级）到 committed / abort（事务级）。
  *
- * 两侧共同写同一个文件（2026-09-14 补 provider 侧）：
- *  - **provider 侧**（`dsh-compact-provider` 的 session_compact 工具）：
- *    `requested`（工具被调用，带 reason 摘要）→ `rejected`（前置判据不过，未触 seam）
- *    / `completed`（seam 返回）/ `failed`（seam 抛错）
- *  - **引擎侧**（AgentCompactEngine）：`begin` → `queued` → `waited` → `surfaced` → `captured`，失败写 `abort`
- * 两侧用 `side` 字段区分。**一条 `tail` 即可回答「谁发起 / 投给谁 / 断在哪一段 / 结果 / 耗时」。**
+ * 0.2.0（标记驱动）后的阶段词汇：
+ *  - **引擎侧**：`detected`（识别到合法 checkpoint 块）→ `committed`（表层已换血）；
+ *    `skipped`（是意图但没压：幂等 / 无可压区间 / 拿不到 agent）；
+ *    `rejected`（**有哨兵但不合法**——写坏了，必须响亮）；`abort`（事务抛错）
+ *  - **工具侧**（`dsh-compact-provider`）：`requested` → `completed` / `failed`
+ * 两侧用 `side` 字段区分。**一条 `tail` 即可回答「谁发起 / 断在哪一段 / 结果 / 耗时」。**
+ *
+ * 历史词汇（`begin` / `queued` / `waited` / `surfaced` / `captured`）属 0.1.x 的投递链，
+ * 已随该链路删除；旧轨迹行仍可能含它们（读侧按字符串处理，不受影响）。
  */
 export type TracePhase =
   | 'boot'
@@ -40,12 +43,15 @@ export type TracePhase =
   | 'rejected'
   | 'completed'
   | 'failed'
+  | 'detected'
+  | 'skipped'
+  | 'committed'
+  | 'abort'
   | 'begin'
   | 'queued'
   | 'waited'
   | 'surfaced'
   | 'captured'
-  | 'abort'
 
 /** 一行轨迹。字段全可选（除 atMs/phase/build），便于阶段增量补写。 */
 export interface TraceEntry {

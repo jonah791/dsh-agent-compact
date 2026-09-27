@@ -1,69 +1,63 @@
 /**
- * Agent-driven compaction backend for DeepSeek Harness.
+ * Agent-driven compaction backend for DeepSeek Harness — **标记即压缩**（0.2.0）.
  *
- * Manual /compact: the agent summarizes its OWN conversation instead of
- * replaying the whole history into a separate LLM request. The conversation
- * history is the agent's context, so the summarizing turn is a direct
- * continuation of the live session — the provider's KV cache for the prefix
- * is warm and no giant replay payload is ever assembled. Automatic
- * step-pressure and context-overflow compaction keep the official replay
- * strategy (their inputs are bounded by the routed model's context window).
+ * 设计主张（2026-09-27 重设计）：压缩不是「引擎要 agent 总结」，而是「agent 的输出
+ * 本身就是压缩请求」。引擎在旁路观察会话事件流；看到一条助手消息里含**合法
+ * checkpoint 块**时，把该消息**之前**的历史替换成这份摘要。
  *
- * The durable transaction (compaction/start → compaction/summary → user/message
- * replace → compaction/end → flush) is byte-compatible with the official
- * compaction-basic backend, so logs stay interchangeable.
+ * ⇒ 投递链整体不存在：没有 `agent.send` 指令、没有表层取证、没有等待轮询、没有候选猜测。
+ * 三次历史事故（入队未进表层 / 指令被重试吃掉 / 重启后孤儿 checkpoint）长在同一条链上，
+ * 它们不是被修好，是被**删掉**。成本同时少一笔全上下文请求（实测意图请求 563k tok）。
+ *
+ * 框架自动压缩**不存在**：`compactIfNeeded` 恒返回 null，引擎不注册任何 pressure /
+ * overflow 监听（AGENTS.md §2.4「禁止框架自动压缩」）。压缩只由 agent 说了算。
+ *
+ * 事件序列与官方 compaction 事务**字节兼容**（`compaction/start` → `compaction/summary`
+ * → `user/message` 三键 replace → `compaction/end`），且闭合在提交那一刻的回合内
+ * （满足 0.1.7 读侧硬判据）。
+ *
  * @module dsh-agent-compact
  */
 
 import { Context } from '@deepseek-ai/cordis'
-import z from '@deepseek-ai/schemastery'
 import { CompactionEngine, ManualCompactionError } from '@deepseek-ai/dsh-compaction'
 import type { CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compaction'
-import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
-import type { Session } from '@deepseek-ai/dsh-session'
-import { CONTEXT_WINDOW_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
-import { assertNever } from '@deepseek-ai/dsh-util-values'
-import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
-import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
-import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
-// Type-only: makes the optional sibling service available to `ctx.get()`.
-import type {} from '@deepseek-ai/dsh-compaction-tool-result-pruner'
-import {
-  resolveCompactSpec,
-  resolveConfig,
-  resolveTargetPolicy,
-  TargetPressureConfigError,
-} from './config.ts'
-import {
-  assertNoActiveCompaction,
-  compactSurfaceRegion,
-  inspectCompactionEntryState,
-  selectCompactableRange,
-} from './region.ts'
-import { agentSummarize, summarizeWithLlm } from './summarizer.ts'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import { CHECKPOINT_SENTINEL, frameSummary, parseCheckpointBlock } from './checkpoint-block.ts'
+import type { CheckpointBlock } from './checkpoint-block.ts'
+import { assistantTextOf, latestCompactionEndSeq, selectMarkerSpan } from './marker.ts'
+import { compactableHeadSeq, compactSurfaceRegion, inspectCompactionEntryState } from './region.ts'
+import { Config, resolveConfig } from './config.ts'
+import type { CompactConfig, ResolvedCompactConfig } from './config.ts'
 import { sessionTagOf, trace } from './trace.ts'
-import type { TraceEntry, TracePhase } from './trace.ts'
-import type { SummarizationInput, SummaryResult } from './summarizer.ts'
-import type {
-  BasicCompactionConfig,
-  ModelCompactPolicyConfig,
-} from './types.ts'
+import { VERSION } from './version.ts'
 
-export type {
-  BasicCompactionConfig,
-  CompactionPolicyConfig,
-  ModelCompactPolicyConfig,
-  ResolvedCompactSpec,
-  ResolvedConfig,
-  ResolvedRetention,
-  ResolvedTargetPolicy,
-} from './types.ts'
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-agent-compact': { kind: 'dsh-agent-compact' }
+  }
+}
 
-// 转出侧车轨迹原语（2026-09-14）：让消费方 `dsh-compact-provider` 用**同一份**路径解析/
-// 序列化/追加实现写同一个文件——避免两套判据互相漂移（§5.22 规则 4 判据单一真源）。
+export { Config, DEFAULT_MIN_CHECKPOINT_CHARS, resolveConfig } from './config.ts'
+export type { CompactConfig, ResolvedCompactConfig } from './config.ts'
+export {
+  CHECKPOINT_SECTIONS,
+  CHECKPOINT_SENTINEL,
+  formatCheckpointBlock,
+  isInsideFence,
+  parseCheckpointBlock,
+} from './checkpoint-block.ts'
+export type { CheckpointBlock } from './checkpoint-block.ts'
+export { assistantTextOf, latestCompactionEndSeq, selectMarkerSpan } from './marker.ts'
+export type { MarkerSpan } from './marker.ts'
+
+// 转出侧车轨迹原语（2026-09-14）：让消费方（`dsh-compact-provider` 的工具入口）用**同一份**
+// 路径解析/序列化/追加实现写同一个文件——避免两套判据互相漂移（§5.22 规则 4）。
 // 走主入口转出而非 package.json 子路径导出：消费方副本的 package.json 由 pnpm 重写，
-// 新增子路径导出**不会**同步过去（实测 False），届时 ERR_PACKAGE_PATH_NOT_EXPORTED
-// 会让 provider 装载失败 = 压缩路径整体不可用。主入口 `./lib/index.js` 是硬链接（改动即时可见）。
+// 新增子路径导出**不会**同步过去（实测 False）。
 export {
   BUILD as compactTraceBuild,
   appendTraceEntry,
@@ -77,465 +71,297 @@ export {
 } from './trace.ts'
 export type { TraceEntry, TracePhase } from './trace.ts'
 
-/** The region transaction's view of this service's dynamically dispatched summarizer. */
-type RegionSummarize = (
-  input: SummarizationInput,
-  agent: Agent,
-  signal?: AbortSignal,
-) => Promise<SummaryResult>
+/** 会话事件视图（宽松结构断言：只需要 seq 与按 seq 取事件）。 */
+interface SessionView {
+  readonly seq: number
+  eventAt(seq: number): { readonly type?: string; readonly data?: unknown } | undefined
+  readonly id: string
+  readonly surface: { readonly nodes: readonly SessionSeq[] }
+}
+
+/** 进程内一次性告警去重（同一 seq 只在首次报告）。 */
+const reported = new WeakMap<object, Set<number>>()
 
 /**
- * 自动压缩路径的阶段轨迹（2026-09-23 补 · §5.22 规则 1）。
+ * 标记驱动压缩引擎。
  *
- * **缺口**：侧车轨迹原先只覆盖**手动路径**（`summarizer.ts` 的 agentSummarize 记
- * begin/queued/waited/surfaced/captured/abort，provider 侧记 requested/completed/failed），
- * 而自动路径（步间压力 / 请求溢出恢复 / 忙会话手动）**一条都不记**——三处失败处理
- * 只写 `ctx.logger.warn`，而宿主 logger **不落盘**。
- * 代价实测：2026-09-23 修 12 个被写坏的会话时，无法回答「哪条路径写的 / 哪个构建写的 /
- * 断在哪一阶段」，只能事后反解事件流。
- *
- * 为什么集中在这里：调用点才知道**触发路径**（trigger），也让 `region.ts` 保持纯净
- * （它只负责事务语义，不负责观测）。
- * @param phase - 阶段（`begin` 起、`captured` 成、`abort` 败）。
- * @param trigger - 触发路径：`step-pressure` / `context-overflow` / `manual-idle` / `manual-busy`。
- * @param agent - 被压缩的 agent（提供 id 与会话前缀）。
- * @param extra - 附加字段（error / waitedMs / chars 等）。
- */
-function traceAutomatic(
-  phase: TracePhase,
-  trigger: string,
-  agent: Agent,
-  extra: Omit<Partial<TraceEntry>, 'trigger'> = {},
-): void {
-  trace({
-    phase,
-    trigger,
-    agentId: agent.id,
-    session: sessionTagOf(agent.session),
-    ...extra,
-  })
-}
-
-/** 错误链文本（轨迹里只留一行；非 Error 也如实转字符串）。 */
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
-
-/**
- * checkpoint 字符数（轨迹字段）：对结果做**宽松形状断言**——拿不到就不记。
- * 轨迹是观测，不得因字段形状猜错而破坏压缩主流程（§5.24：观测绝不反噬主流程）。
- * @param result - 压缩结果（可能为 null：未触发）。
- * @returns 字符数；形状不符时 `undefined`。
- */
-function summaryCharsOf(result: CompactionResult | null): number | undefined {
-  const summary = (result as { summary?: unknown } | null)?.summary
-  return typeof summary === 'string' ? summary.length : undefined
-}
-
-/** Resolve the exact provider/model durably routed for the latest request. */
-function routedTarget(
-  session: Session,
-): Pick<LlmCallConfig, 'provider' | 'model'> | undefined {
-  const config = session.requestHeader()?.config
-  if (config === undefined || config.provider.length === 0 || config.model.length === 0) {
-    return undefined
-  }
-  return { provider: config.provider, model: config.model }
-}
-
-/** Resolve the conversation target used to select an optional policy override. */
-function conversationTarget(
-  agent: Agent,
-): Pick<LlmCallConfig, 'provider' | 'model'> | undefined {
-  const routed = routedTarget(agent.session)
-  if (routed !== undefined) return routed
-  if (agent.options.provider === undefined || agent.options.provider.length === 0
-    || agent.options.model === undefined || agent.options.model.length === 0) return undefined
-  return { provider: agent.options.provider, model: agent.options.model }
-}
-
-const thresholdRatioSchema = z.number()
-const retainRatioSchema = z.number()
-const retainTokensSchema = z.number().step(1).min(0)
-const summarizationProviderSchema = z.string()
-const summarizationModelSchema = z.string()
-const maxTokensSchema = z.number().step(1).min(1)
-const compactionRetriesSchema = z.number().step(1).min(0)
-const maxOverflowRetriesSchema = z.number().step(1).min(0)
-
-const modelPolicy: z<ModelCompactPolicyConfig> = z.object({
-  provider: z.string().required(),
-  model: z.string().required(),
-  thresholdRatio: thresholdRatioSchema,
-  retainRatio: retainRatioSchema,
-  retainTokens: retainTokensSchema,
-  summarizationProvider: summarizationProviderSchema,
-  summarizationModel: summarizationModelSchema,
-  maxTokens: maxTokensSchema,
-  compactionRetries: compactionRetriesSchema,
-  maxOverflowRetries: maxOverflowRetriesSchema,
-})
-
-/**
- * Agent-driven compaction backend. `compactNow` can run at any moment
- * ("想压就压"): an idle session compacts synchronously, while a busy session
- * queues the summarization instruction into the agent's inbox — the agent's
- * next output after its current thinking IS the summary, and the replacement
- * happens as soon as it lands; the command returns immediately either way.
- * Automatic paths use the official replay summarizer (bounded by the routed
- * model's context window).
+ * 两条入口共用同一个事务：
+ * - **标记路径**（主路径，零额外请求）：agent 在自己任意一轮的输出里写合法 checkpoint 块。
+ * - **工具路径**（显式）：调用方直接把摘要交给 {@link AgentCompactEngine.compactWithSummary}。
  */
 export class AgentCompactEngine extends CompactionEngine {
-  static inject = ['llm', 'tokenMeter', 'sessions']
+  static inject = ['agents', 'tokenMeter', 'sessions']
 
-  static Config: z<BasicCompactionConfig> = z.object({
-    thresholdRatio: thresholdRatioSchema,
-    retainRatio: retainRatioSchema,
-    retainTokens: retainTokensSchema,
-    summarizationProvider: summarizationProviderSchema,
-    summarizationModel: summarizationModelSchema,
-    maxTokens: maxTokensSchema,
-    compactionRetries: compactionRetriesSchema,
-    maxOverflowRetries: maxOverflowRetriesSchema,
-    modelPolicies: z.array(modelPolicy),
-    auto: z.boolean(),
-  })
+  static Config = Config
 
-  /** Resolved and validated compaction configuration. */
-  readonly config: ReturnType<typeof resolveConfig>
+  /** 已解析的部署配置。 */
+  readonly config: ResolvedCompactConfig
 
-  /** Sessions currently running a manual agent-driven compaction. */
-  private readonly active = new Set<string>()
-
-  private readonly warnedPressureConfigTargets = new Set<string>()
-  private readonly overflowRetries = new WeakMap<Agent, number>()
-  private readonly overflowAgents = new WeakMap<Session, Agent>()
-
-  constructor(ctx: Context, config: BasicCompactionConfig = {}) {
+  constructor(ctx: Context, config: CompactConfig = {}) {
     super(ctx)
     this.config = resolveConfig(config)
-    if (this.config.auto) this._registerAutomaticCompaction()
+    if (this.config.enabled) this.registerMarkerPath()
   }
 
   /**
-   * The automatic-path summarizer: official replay strategy, bounded by the
-   * routed model's context window.
+   * 本引擎**没有自动路径**：不因步间压力或请求溢出自行压缩。
+   *
+   * 「何时压」是 agent 的决策（AGENTS.md §2.4：主人 2026-08-16「不要开自动压缩，
+   * 别让框架强制影响你的决策」）。保留该实现只为满足 seam 契约——恒返回 `null`。
+   * @returns 恒为 `null`（永不自动压缩）
    */
-  protected async summarize(
-    input: SummarizationInput,
-    agent: Agent,
-    signal?: AbortSignal,
-  ): Promise<SummaryResult> {
-    const target = conversationTarget(agent)
-    const config = target === undefined
-      ? this.config
-      : resolveTargetPolicy(this.config, target)
-    return summarizeWithLlm(this.ctx, config, input, agent, signal)
-  }
-
-  /**
-   * Compact for replayed step-boundary pressure or one provider-confirmed
-   * context overflow (official policy; automatic paths only).
-   */
-  override async compactIfNeeded(
-    agent: Agent,
-    trigger: CompactionTrigger,
-    signal: AbortSignal,
+  override compactIfNeeded(
+    _agent: unknown,
+    _trigger: CompactionTrigger,
+    _signal: AbortSignal,
   ): Promise<CompactionResult | null> {
-    const target = routedTarget(agent.session)
-    if (target === undefined) return null
-    const policy = resolveTargetPolicy(this.config, target)
-    const meter = this.ctx.tokenMeter
-    let measurement = meter.measure(agent.session)
-    switch (trigger) {
-      case 'context-overflow':
-        break
-      case 'pressure':
-        break
-      /* v8 ignore next -- closed-union exhaustiveness guard */
-      default:
-        assertNever(trigger, 'compaction trigger')
-    }
-
-    const prune = this.ctx.get('toolResultPruner')
-
-    if (trigger === 'context-overflow') {
-      if (prune !== undefined) {
-        prune.pruneSession(agent.session)
-        measurement = meter.measure(agent.session)
-      }
-      const range = selectCompactableRange(agent.session, measurement, 0)
-      if (range === null) return null
-      return this.compactRegion(range.start, range.end, agent, signal)
-    }
-
-    const context = (await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)).context
-    assertNoActiveCompaction(agent.session, 'automatic pressure compaction')
-    const targetKey = `${target.provider}/${target.model}`
-    if (context === undefined) {
-      throw new TargetPressureConfigError(
-        targetKey,
-        `dsh-agent-compact: no context capacity for ${targetKey}; `
-        + 'configure contextWindow on that adapter model',
-      )
-    }
-    const spec = resolveCompactSpec(policy, context.contextWindow)
-    if (measurement.totalTokens < spec.thresholdTokens) return null
-
-    if (prune !== undefined) {
-      prune.pruneSession(agent.session)
-      measurement = meter.measure(agent.session)
-    }
-    if (measurement.totalTokens < spec.thresholdTokens) return null
-
-    let result: CompactionResult | null = null
-    for (let attempt = 0; attempt <= spec.compactionRetries; attempt += 1) {
-      const range = selectCompactableRange(agent.session, measurement, spec.retainTokens)
-      if (range === null) {
-        if (result === null) return null
-        break
-      }
-      result = await this.compactRegion(range.start, range.end, agent, signal)
-      measurement = meter.measure(agent.session)
-      if (measurement.totalTokens < spec.thresholdTokens) return result
-    }
-
-    throw new Error(
-      `compaction still above threshold after ${spec.compactionRetries + 1} compaction attempts `
-      + `(${measurement.totalTokens} estimated tokens >= threshold ${spec.thresholdTokens})`,
-    )
-  }
-
-  /**
-   * Compact one inclusive positional range from the agent-owned surface
-   * (automatic path: official replay summarizer, open-turn owner).
-   */
-  override async compactRegion(
-    start: number,
-    end: number,
-    agent: Agent,
-    signal?: AbortSignal,
-  ): Promise<CompactionResult> {
-    return compactSurfaceRegion(
-      this.regionDependencies(),
-      agent.session,
-      start,
-      end,
-      agent,
-      { owner: 'current-turn', stability: 'whole-surface' },
-      signal,
-    )
-  }
-
-  /**
-   * Force one useful idle-session compaction, driven by the agent itself: the
-   * agent receives the compaction instruction as its next turn, summarizes its
-   * own conversation (warm KV prefix, no replay payload), and the summarizing
-   * reply becomes the checkpoint. The summarizing turn stays visible in the log.
-   */
-  override compactNow(
-    agent: Agent,
-    signal: AbortSignal,
-    sourceCommandId?: CommandId,
-  ): Promise<CompactionResult | null> {
-    signal.throwIfAborted()
-    if (this.active.has(agent.id)) {
-      throw new ManualCompactionError(
-        'busy',
-        'manual compaction is already running for this agent',
-      )
-    }
-    const range = selectCompactableRange(
-      agent.session,
-      this.ctx.tokenMeter.measure(agent.session),
-      0,
-    )
-    if (range === null) return Promise.resolve(null)
-    const entryState = inspectCompactionEntryState(agent.session as any)
-    const owner = entryState.openTurn === null ? null : 'current-turn'
-    this.active.add(agent.id)
-    const run = (): Promise<CompactionResult> => compactSurfaceRegion(
-      this.agentDependencies(agent),
-      agent.session,
-      range.start,
-      range.end,
-      agent,
-      {
-        owner,
-        stability: 'selected-span',
-        ...sourceCommandId === undefined ? {} : { sourceCommandId },
-        flush: async () => {
-          await this.ctx.sessions.flush(agent.session)
-        },
-      },
-      signal,
-    )
-    if (owner === null) {
-      // 空闲会话：同步执行，命令等待真实结果。
-      return run().then(
-        (result) => {
-          this.active.delete(agent.id)
-          traceAutomatic('captured', 'manual-idle', agent, { chars: summaryCharsOf(result) })
-          return result
-        },
-        (error) => {
-          this.active.delete(agent.id)
-          traceAutomatic('abort', 'manual-idle', agent, { error: errorText(error) })
-          throw error
-        },
-      )
-    }
-    // 会话正忙：想压就压——总结指令排入 inbox，agent 当前思维结束后的下一次
-    // 输出即总结，产生后即替换；命令立即确认，不阻塞正在进行的思考。
-    void run().then(
-      (result) => {
-        this.active.delete(agent.id)
-        traceAutomatic('captured', 'manual-busy', agent, {
-          chars: summaryCharsOf(result),
-          note: 'fire-and-forget 手动压缩完成（属主回合＝提交那一刻开着的回合）',
-        })
-      },
-      (error) => {
-        this.active.delete(agent.id)
-        const message = errorText(error)
-        // 失败必须落盘：补丁后「start 之前失败」不再留未闭合 start（读侧要求），
-        // 若这里也只进 logger，则这一笔在事后**完全不可见**（2026-09-23 缺口）。
-        traceAutomatic('abort', 'manual-busy', agent, { error: message })
-        this.ctx.logger.warn(
-          `queued manual compaction failed: ${message}; the conversation is unchanged`,
-        )
-      },
-    )
     return Promise.resolve(null)
   }
 
-  /** Bind the token meter and the official replay summarizer (automatic paths). */
-  private regionDependencies(): { meter: TokenMeter; summarize: RegionSummarize } {
-    return {
-      meter: this.ctx.tokenMeter,
-      summarize: (input, agent, signal) => this.summarize(input, agent, signal),
-    }
-  }
-
-  /** Bind the token meter and the agent-driven summarizer (manual path). */
-  private agentDependencies(agent: Agent): { meter: TokenMeter; summarize: RegionSummarize } {
-    return {
-      meter: this.ctx.tokenMeter,
-      summarize: (_input, _agent, signal) => agentSummarize(this.ctx, agent, signal),
-    }
+  /**
+   * 本引擎**没有引擎发起的压缩**：没有摘要可压。摘要只能来自 agent 自己的输出
+   * （标记路径）或显式调用方（工具路径）。
+   * @throws {@link ManualCompactionError} 恒抛（`summary` 类），附替代路径说明
+   */
+  override compactNow(): Promise<CompactionResult | null> {
+    return Promise.reject(new ManualCompactionError(
+      'summary',
+      'agent-driven compaction has no engine-initiated path: the summary must come from the '
+      + 'agent\'s own output (checkpoint block) or from an explicit caller. '
+      + 'There is no replay summarizer in this backend.',
+    ))
   }
 
   /**
-   * Register automatic between-step pressure and model-request overflow
-   * recovery (official hooks).
+   * 本引擎不做「按 replay 重放总结一个区间」——那条路径需要独立的全量载荷请求，
+   * 与「压缩由 agent 自己的输出供给」互斥。
+   * @throws {@link ManualCompactionError} 恒抛（`summary` 类）
    */
-  private _registerAutomaticCompaction(): void {
-    const { ctx } = this
-    const logResult = (result: CompactionResult, trigger: string): void => {
-      ctx.logger.info(
-        `compaction (${trigger}): shadowed ${result.shadowedSeqs.length} surface nodes `
-        + `(seqs ${result.shadowedRange.start}-${result.shadowedRange.end}, `
-        + `~${result.shadowedTokenCount} tokens)`,
-      )
+  override compactRegion(): Promise<CompactionResult> {
+    return Promise.reject(new ManualCompactionError(
+      'summary',
+      'this backend compacts only with a caller-provided checkpoint; range compaction '
+      + 'via a replay summarizer is not implemented.',
+    ))
+  }
+
+  /**
+   * 显式入口：用调用方供给的摘要立即压缩「该消息之前」的历史。
+   *
+   * 与标记路径共用同一事务（同一区间规则、同一事件序列、同一幂等语义）——两条入口
+   * 只有「摘要从哪来」不同。
+   * @param agent - 会话属主（提供 session 与路由信息）
+   * @param summary - checkpoint 正文（调用方负责其内容与体量）
+   * @param beforeSeq - 区间终点取「该 seq 在表层的前一个节点」；缺省用 surface 末节点
+   * @param sourceCommandId - 事务来源标识（记账用）
+   * @returns 压缩结果；无可压区间时为 `null`
+   * @throws 事务失败时（摘要不小于被替换内容 / 区间失衡 / 写盘失败）
+   */
+  async compactWithSummary(
+    agent: Agent,
+    summary: string,
+    beforeSeq?: number,
+    sourceCommandId?: string,
+  ): Promise<CompactionResult | null> {
+    const session = agent.session as unknown as SessionView
+    const nodes = session.surface.nodes
+    const headSeq = compactableHeadSeq(session as unknown as Session)
+    const markerSeq = beforeSeq ?? nodes[nodes.length - 1] ?? 0
+    const span = selectMarkerSpan(nodes, markerSeq, headSeq)
+    if (span.kind === 'skip') {
+      trace({
+        phase: 'skipped',
+        trigger: 'tool',
+        session: sessionTagOf(session),
+        chars: summary.length,
+        note: span.reason,
+      })
+      return null
+    }
+    return this.commit(session as unknown as Session, span.start as SessionSeq, span.end as SessionSeq, agent, summary, 'tool', sourceCommandId)
+  }
+
+  /**
+   * 注册标记路径：观察助手消息，识别合法 checkpoint 块并提交事务。
+   *
+   * 为什么用 `session/event` + `setImmediate`：监听器跑在 `session.append` 内部，
+   * 就地再 append 会 reenter（§5.12 规则 4 的同一课）；推迟一个宏任务后，
+   * 提交时读到的回合状态就是真实状态（回合内 / 回合间都可提交）。
+   */
+  private registerMarkerPath(): void {
+    this.ctx.on('session/event', (session, event) => {
+      if (event.type !== 'assistant/message') return
+      const data = event.data as { message?: { content?: unknown } } | undefined
+      const text = assistantTextOf(data?.message?.content)
+      // 快筛：没有哨兵就不是压缩意图——绝大多数消息在这里返回，零后续成本
+      if (!text.includes(CHECKPOINT_SENTINEL)) return
+      const parsed = parseCheckpointBlock(text, this.config.minCheckpointChars)
+      if (parsed.kind === 'absent') return
+      setImmediate(() => {
+        void this.handleMarker(session as unknown as SessionView, event.seq, parsed)
+      })
+    })
+  }
+
+  /** 处理一条含哨兵的助手消息：幂等 → 解析结论 → 提交或响亮报告。 */
+  private async handleMarker(
+    session: SessionView,
+    markerSeq: number,
+    parsed: Exclude<CheckpointBlock, { kind: 'absent' }>,
+  ): Promise<void> {
+    const sid = sessionTagOf(session)
+    if (parsed.kind === 'invalid') {
+      trace({
+        phase: 'rejected', trigger: 'marker', session: sid, seqFloor: markerSeq,
+        chars: parsed.chars, error: parsed.reason,
+      })
+      // 「响」优先：写坏一块 checkpoint 不能静默——下个 step 我会看到原因并重写
+      this.notifyOnce(session, markerSeq, [
+        '⚠ 这次 checkpoint 未生效，会话历史**未改动**。',
+        '原因：' + parsed.reason,
+        '要压缩请重发一块：首行哨兵 `' + CHECKPOINT_SENTINEL + '`，紧跟 <compacted-summary> 外壳，',
+        '正文含全部 8 个 section（Primary Request and Intent … Critical Context），长度 ≥ '
+        + String(this.config.minCheckpointChars) + ' 字符，且不要放进围栏代码块。',
+      ].join('\n'))
+      return
     }
 
-    ctx.on('agent/pre-step', async (
-      { agent, signal },
-      next,
-    ): Promise<PreStepDecision> => {
-      if (!signal.aborted) {
-        try {
-          const result = await this.compactIfNeeded(agent, 'pressure', signal)
-          if (result !== null) {
-            logResult(result, 'step pressure')
-            traceAutomatic('captured', 'step-pressure', agent, { chars: summaryCharsOf(result) })
-          }
-        } catch (error: unknown) {
-          const message = errorText(error)
-          if (error instanceof TargetPressureConfigError) {
-            // 配置类错误按 targetKey 去重（每个 target 只喊一次），轨迹同样只落一次
-            if (this.warnedPressureConfigTargets.has(error.targetKey)) return next()
-            this.warnedPressureConfigTargets.add(error.targetKey)
-          }
-          traceAutomatic('abort', 'step-pressure', agent, {
-            error: message,
-            ...(error instanceof TargetPressureConfigError ? { note: 'target-config' } : {}),
-          })
-          ctx.logger.warn(`step compaction failed: ${message}; continuing the turn`)
-        }
-      }
-      return next()
-    })
+    // 幂等：已处理过的标记消息，其 seq 必然小于此后写入的 compaction/end seq
+    const boundary = latestCompactionEndSeq(session)
+    if (boundary !== undefined && markerSeq < boundary) {
+      trace({
+        phase: 'skipped', trigger: 'marker', session: sid, seqFloor: markerSeq,
+        note: '已处理过（幂等：seq ' + String(markerSeq) + ' < compaction/end ' + String(boundary) + '）',
+      })
+      return
+    }
 
-    ctx.on('agent/status', ({ agent, status }) => {
-      if (status === 'idle') this.overflowRetries.delete(agent)
-    })
+    const agent = this.ctx.agents.get(session.id as never)
+    if (agent === undefined) {
+      // 拿不到属主就压不了：如实记账，不猜、不静默
+      trace({
+        phase: 'skipped', trigger: 'marker', session: sid, seqFloor: markerSeq,
+        note: 'agents 注册表里没有该会话的 agent（无法提交事务）',
+      })
+      return
+    }
 
-    // A successful response starts a fresh overflow-recovery sequence even
-    // when tool calls continue the same turn into another request.
-    ctx.on('session/event', (session, event) => {
-      if (event.type !== 'assistant/message') return
-      const agent = this.overflowAgents.get(session)
-      if (agent !== undefined) this.overflowRetries.delete(agent)
-    })
+    const headSeq = compactableHeadSeq(session as unknown as Session)
+    const span = selectMarkerSpan(session.surface.nodes, markerSeq, headSeq)
+    if (span.kind === 'skip') {
+      trace({ phase: 'skipped', trigger: 'marker', session: sid, seqFloor: markerSeq, note: span.reason })
+      return
+    }
 
-    ctx.on('agent/request-error', async (
-      { agent, failure, signal },
-      next,
-    ) => {
-      if (failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE || signal.aborted) return next()
-      this.overflowAgents.set(agent.session, agent)
-      const target = routedTarget(agent.session)
-      if (target === undefined) return next()
-      const policy = resolveTargetPolicy(this.config, target)
-      const retries = this.overflowRetries.get(agent) ?? 0
-      if (retries >= policy.maxOverflowRetries) return next()
-
-      const generation = agent.session.surface.replaceGeneration
-      let result: CompactionResult | null
-      try {
-        result = await this.compactIfNeeded(agent, 'context-overflow', signal)
-      } catch (recoveryError: unknown) {
-        const message = errorText(recoveryError)
-        traceAutomatic('abort', 'context-overflow', agent, {
-          error: message,
-          ...(!signal.aborted && agent.session.surface.replaceGeneration > generation
-            ? { note: 'durable-surface-progress' }
-            : {}),
-        })
-        if (!signal.aborted && agent.session.surface.replaceGeneration > generation) {
-          ctx.logger.warn(
-            `context-overflow compaction failed after durable surface progress: ${message}; `
-            + 'retrying from the replacement surface',
-          )
-          this.overflowRetries.set(agent, retries + 1)
-          return { kind: 'retry' }
-        }
-        ctx.logger.warn(
-          `context-overflow compaction failed: ${message}; ${signal.aborted
-            ? 'cancellation prevents retry'
-            : 'preserving the original request error'}`,
-        )
-        return next()
-      }
-      if (signal.aborted
-        || agent.session.surface.replaceGeneration <= generation) return next()
-      if (result !== null) {
-        logResult(result, 'context overflow recovery')
-        traceAutomatic('captured', 'context-overflow', agent, { chars: summaryCharsOf(result) })
-      }
-      this.overflowRetries.set(agent, retries + 1)
-      return { kind: 'retry' }
+    trace({
+      phase: 'detected', trigger: 'marker', session: sid, seqFloor: markerSeq,
+      chars: parsed.chars, agentId: agent.id,
     })
+    try {
+      const result = await this.commit(
+        session as unknown as Session,
+        span.start as SessionSeq,
+        span.end as SessionSeq,
+        agent,
+        parsed.body,
+        'marker',
+      )
+      trace({
+        phase: 'committed', trigger: 'marker', session: sid, seqFloor: markerSeq,
+        chars: parsed.chars, waitedMs: 0,
+        note: 'shadowed ' + String(result.shadowedSeqs.length) + ' nodes (seqs '
+          + String(result.shadowedRange.start) + '-' + String(result.shadowedRange.end) + ')',
+      })
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      trace({ phase: 'abort', trigger: 'marker', session: sid, seqFloor: markerSeq, chars: parsed.chars, error: message })
+      this.notifyOnce(session, markerSeq, [
+        '⚠ 这次 checkpoint 未生效，会话历史**未改动**。',
+        '原因：' + message,
+      ].join('\n'))
+    }
+  }
+
+  /** 一个事务：压缩前保命存档 → 表层替换 → flush。两条入口共用。 */
+  private async commit(
+    session: Session,
+    start: SessionSeq,
+    end: SessionSeq,
+    agent: Agent,
+    body: string,
+    trigger: 'marker' | 'tool',
+    sourceCommandId?: string,
+  ): Promise<CompactionResult> {
+    await this.archiveBestEffort(trigger)
+    const blocks: ContentBlock[] = [{ type: 'text', text: body }]
+    const result = await compactSurfaceRegion(
+      {
+        meter: this.ctx.tokenMeter,
+        // 供给式摘要：不建 replay 载荷、不调 LLM——摘要就在手上
+        summarize: () => Promise.resolve({
+          summary: blocks,
+          rawOutput: blocks,
+          provider: agent.options.provider ?? '',
+          model: agent.options.model ?? '',
+        }),
+      },
+      session,
+      start,
+      end,
+      agent,
+      {
+        owner: inspectCompactionEntryState(session as never).openTurn === null ? null : 'current-turn',
+        stability: 'selected-span',
+        ...(sourceCommandId === undefined ? {} : { sourceCommandId: sourceCommandId as never }),
+        flush: async () => { await this.ctx.sessions.flush(session) },
+      },
+    )
+    return result
+  }
+
+  /** 压缩前存档（保命优先）：checkpoint 服务不可用或失败都不阻塞压缩。 */
+  private async archiveBestEffort(trigger: string): Promise<void> {
+    const checkpoint = this.ctx.get('checkpoint') as
+      | { create(reason: string): Promise<unknown> }
+      | undefined
+    if (checkpoint === undefined) return
+    try {
+      await checkpoint.create('压缩前自动存档（' + trigger + '）')
+    } catch (error: unknown) {
+      // 存档是保命网不是前置条件：失败只记账，不拦压缩（压缩本身可重来）
+      this.ctx.logger.warn('pre-compaction checkpoint failed: '
+        + (error instanceof Error ? error.message : String(error)))
+    }
+  }
+
+  /** 注入一条可见的失败告知（同 seq 只报一次；投递绝不反噬主流程）。 */
+  private notifyOnce(session: SessionView, seq: number, text: string): void {
+    const seen = reported.get(session as unknown as object) ?? new Set<number>()
+    if (seen.has(seq)) return
+    seen.add(seq)
+    reported.set(session as unknown as object, seen)
+    const agent = this.ctx.agents.get(session.id as never)
+    if (agent === undefined) return
+    try {
+      agent.send(
+        createUserMessage({
+          content: [{ type: 'text', text }],
+          source: { kind: 'dsh-agent-compact' },
+        }),
+        'next-step',
+        false,
+      )
+    } catch {
+      // 告知是尽力而为：投递失败不得影响会话本身
+    }
   }
 }
 
 // 构建自报（可维护性，2026-09-14）：进程加载即落一行轨迹，声明「我是哪个构建 +
-// 我贡献什么入口 + 我依赖什么服务」。排障第一步历来是「线上跑的是哪个构建」——
-// 以前要手工比 `lib/*.js` mtime 与 web 进程启动时间，现在一行 `--live` 就能答。
+// 我贡献什么 + 我依赖什么服务」。排障第一步历来是「线上跑的是哪个构建」。
 trace({
   phase: 'boot',
-  note: 'inject=llm,tokenMeter,sessions;tools=session_compact;path=agent-driven(manual)',
+  note: 'v' + VERSION + ' inject=agents,tokenMeter,sessions;path=marker-driven(agent output);auto=none',
 })
 
 export default AgentCompactEngine
