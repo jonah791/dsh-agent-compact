@@ -137,4 +137,29 @@ describe('护栏五 · section 按序全在', () => {
     const parsed = parseCheckpointBlock(CHECKPOINT_SENTINEL + '\n' + formatCheckpointBlock(repeated), MIN)
     assert.equal(parsed.kind, 'invalid')
   })
+
+  test('尸体样本：标题带编号前缀（2026-10-02 真实事故形状）→ 报出近似行', () => {
+    // 事故原貌：`## 1 · Primary Request and Intent`——正文长度正常，8 节却全数未命中。
+    const numbered = CHECKPOINT_SECTIONS
+      .map((section, index) =>
+        '## ' + String(index + 1) + ' · ' + section.replace(/^#+\s*/, '') + '\n- ' + 'x'.repeat(30))
+      .join('\n\n')
+    const parsed = parseCheckpointBlock(CHECKPOINT_SENTINEL + '\n' + formatCheckpointBlock(numbered), MIN)
+    assert.equal(parsed.kind, 'invalid')
+    assert.match(parsed.reason, /近似命中/, '必须给出近似诊断')
+    assert.match(parsed.reason, /1 · Primary Request and Intent/, '要点明实际写法——否则读起来仍像「根本没写标题」')
+  })
+
+  test('对照组：真漏一节时不得报近似命中（证明该诊断有分辨力，不是恒亮）', () => {
+    const partial = CHECKPOINT_SECTIONS
+      .slice(0, -1)
+      .map(section => section + '\n- ' + 'x'.repeat(30))
+      .join('\n\n')
+    const parsed = parseCheckpointBlock(CHECKPOINT_SENTINEL + '\n' + formatCheckpointBlock(partial), MIN)
+    assert.equal(parsed.kind, 'invalid')
+    assert.ok(
+      !parsed.reason.includes('近似命中'),
+      '缺失那节的正文里没有近似行，报了就是恒亮——恒亮的提示等于噪音',
+    )
+  })
 })

@@ -59,6 +59,36 @@ export function isInsideFence(text: string, index: number): boolean {
 }
 
 /**
+ * 近似诊断：把「正文里这些标题实际写成什么样」报出来。
+ *
+ * 存在理由（2026-10-02 事故）：6 笔被拒的块**正文长度正常**（3.7K–11.8K 字符），
+ * 但 8 个 section 全数未命中——因为标题被加了编号前缀（`## 1 · Primary Request…`）
+ * 或换了语种（`## 1. 当前任务与目标`）。原报错只列「缺哪八节」，读起来像
+ * 「你根本没写标题」，真相只是一个前缀之差。让判据自己说出近似行，
+ * 比让人回翻会话日志便宜。
+ *
+ * 只做**报告**，不改判据——命中与否仍以逐字匹配为准。
+ * @param body - 外壳内的正文
+ * @returns 至多 3 条近似命中说明
+ */
+function diagnoseMissingSections(body: string): string[] {
+  const lines = body
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line !== '')
+  const hints: string[] = []
+  for (const section of CHECKPOINT_SECTIONS) {
+    const core = section.replace(/^#+\s*/, '')
+    const near = lines.find(line => line.includes(core) && !line.startsWith(section))
+    if (near !== undefined) {
+      const shown = near.length > 60 ? near.slice(0, 60) + '…' : near
+      hints.push('实际写作「' + shown + '」（要求逐字：' + section + '）')
+    }
+  }
+  return hints.slice(0, 3)
+}
+
+/**
  * 在一条助手消息的文本里识别 checkpoint 块。
  *
  * 判据（**全部**满足才算合法，任一不满足即 `invalid` 并附原因——「响」而不是沉默）：
@@ -127,9 +157,11 @@ export function parseCheckpointBlock(text: string, minChars: number): Checkpoint
     scanFrom = found + section.length
   }
   if (missing.length > 0) {
+    const hints = diagnoseMissingSections(body)
+    const suffix = hints.length === 0 ? '' : ' —— 近似命中：' + hints.join('；')
     return {
       kind: 'invalid',
-      reason: '缺少 section（按序查找未命中）：' + missing.join(' / '),
+      reason: '缺少 section（按序查找未命中）：' + missing.join(' / ') + suffix,
       chars: body.length,
     }
   }
