@@ -13,7 +13,7 @@
 <p align="center">
   <a href="https://github.com/jonah791/dsh-agent-compact"><img src="https://img.shields.io/badge/version-0.2.1-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
-  <img src="https://img.shields.io/badge/tests-51%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-59%20passed-brightgreen" alt="tests">
 </p>
 
 **一句话**：压缩**不需要被请求**——**agent 的输出本身就是压缩请求**。agent 在任意一轮写下合法的 checkpoint 块，引擎就在那条消息落盘后把「它之前」的历史换成这份摘要。
