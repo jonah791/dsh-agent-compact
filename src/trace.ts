@@ -120,6 +120,15 @@ export interface TraceEntry {
   chars?: number
   /** 捕获文本是否含 `<compacted-summary>` 标记（captured）。 */
   markerOk?: boolean
+  /**
+   * 这一笔 checkpoint 是否留了**显式的当前最优起点**（`committed` 行）—— 论文迁移
+   * （arXiv:2610.20563）：遗忘之所以有效，是因为**只留 best candidate** 并从它重启；
+   * 留「尝试史」而不留「最优解」＝留住了锚定、丢掉了起点。
+   *
+   * ⚠ **只记录，不阻断**（压缩照常生效）—— 见 `checkpoint-block.ts` 的 `diagnoseBestCandidate`。
+   * 它答的问题是「我这 100 多笔压缩里，有多少笔留了起点」：一个**可数的**读数。
+   */
+  bestCandidate?: boolean
   /** 会话 id 前缀（便于多会话并存时区分）。 */
   session?: string
   /** 自由附注（boot 自报用：入口/依赖声明）。 */
@@ -186,6 +195,7 @@ export function serializeTraceEntry(entry: TraceEntry): string {
     ...(entry.totalMs !== undefined ? { totalMs: entry.totalMs } : {}),
     ...(entry.chars !== undefined ? { chars: entry.chars } : {}),
     ...(entry.markerOk !== undefined ? { markerOk: entry.markerOk } : {}),
+    ...(entry.bestCandidate !== undefined ? { bestCandidate: entry.bestCandidate } : {}),
     ...(entry.session !== undefined ? { session: entry.session } : {}),
     ...(entry.note !== undefined ? { note: entry.note } : {}),
     ...(entry.error !== undefined ? { error: entry.error } : {}),

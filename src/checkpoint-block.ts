@@ -89,6 +89,52 @@ function diagnoseMissingSections(body: string): string[] {
 }
 
 /**
+ * 「当前最优解」的显式标记 —— 论文迁移（arXiv:2610.20563 *Scaling Discovery Requires Forgetting*）。
+ *
+ * ★ 为什么需要它：论文的核心操作是「丢弃 session 与搜索状态，**只留 best candidate**，
+ *   从它重启」——四个任务上比并行 agent 高 15%、比单 agent 高 39%，且**代价只有继续的一半**
+ *   （继续 30 提案：单 agent +1.6% / 并行 +1.9% / 团队 +1.4%；遗忘：+4.5% / +7.0% / +9.2%）。
+ *
+ * ⚠ 而我的 checkpoint 从来没有一格承载「best candidate」：`Files and Code` 是产物清单、
+ *   `Current Work` 是「我正在做什么」、`Next Step` 是「下一步」——**没有一格说「当前最好的是什么、
+ *   凭什么说它最好」**。⇒ 压缩后接续的我会看到**全部上下文摘要**，而不是**单一最优起点**：
+ *   这正是论文说的锚定条件（conditioned on earlier failed attempts towards certain directions）。
+ *
+ * ⚠ 判据取**行首 + 加粗/方括号 + 冒号**的显式形态，**不做自由文本提及匹配**：
+ *   本文件自身、技能文档、以及任何「讨论这篇论文」的会话都会出现 `best candidate` 字样，
+ *   按词匹配的判据会在那些地方**恒真**（一条恒为真的判据不是证据，§5.9）。
+ */
+export const BEST_CANDIDATE_MARKER = '**Best candidate**'
+
+/** 认的显式形态（行首，可带列表符号；必须紧跟冒号）。中英各一，单一真源在此。 */
+/**
+ * 认的显式形态（行首，可带列表符号；必须紧跟冒号）。中英各一，单一真源在此。
+ * ☠ 尸体注入已验（2026-10-17）：把本行换成恒真的 `/^/im` ⇒ `diagnoseBestCandidate` 的
+ *   3 条「不算 present」测试**全红**（`not ok 12` / fail 3）⇒ 判据有分辨力，不是恒绿。
+ */
+const BEST_LINE_RE = /^\s*(?:[-*+]\s*)?(?:\*\*Best candidate\*\*|\*\*最优产物\*\*|\[BEST\])\s*[:：]/im
+
+/**
+ * 诊断：正文里有没有**显式**的最优起点行。
+ *
+ * ⚠ 只报告，**不改判据、不阻断压缩**（§5.39：信号不是拦截）——缺了它压缩照常生效，
+ *   只是我能在 trace 里看见「这一笔没留最优起点」。判据与诊断分离的理由：
+ *   把「没写 best」变成拒收，等于用一条**新纪律**去管一件**机制该管**的事；
+ *   而论文的结论恰恰是「留什么」比「留多少」更决定成败 ⇒ 该被**看见**，不该被**强制**。
+ * @param body - checkpoint 正文
+ * @returns `present` 与一句人读提示（命中时提示为空串）
+ */
+export function diagnoseBestCandidate(body: string): { present: boolean; hint: string } {
+  if (BEST_LINE_RE.test(body)) return { present: true, hint: '' }
+  return {
+    present: false,
+    hint: '正文里没有行首的显式最优起点（'
+      + BEST_CANDIDATE_MARKER + ': <产物指针>（判据：…））'
+      + '—— 压缩只留了「做过什么」，没留「当前最好的是什么」',
+  }
+}
+
+/**
  * 在一条助手消息的文本里识别 checkpoint 块。
  *
  * 判据（**全部**满足才算合法，任一不满足即 `invalid` 并附原因——「响」而不是沉默）：

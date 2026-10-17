@@ -27,7 +27,7 @@ import type { Session, SessionSeq } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import { createArchiveDispatcher } from './archive.ts'
-import { CHECKPOINT_SENTINEL, frameSummary, parseCheckpointBlock } from './checkpoint-block.ts'
+import { CHECKPOINT_SENTINEL, diagnoseBestCandidate, frameSummary, parseCheckpointBlock } from './checkpoint-block.ts'
 import type { CheckpointBlock } from './checkpoint-block.ts'
 import { assistantTextOf, latestCompactionEndSeq, selectMarkerSpan } from './marker.ts'
 import { compactableHeadSeq, compactSurfaceRegion, inspectCompactionEntryState } from './region.ts'
@@ -214,6 +214,7 @@ export class AgentCompactEngine extends CompactionEngine {
     trace({
       phase: 'committed', trigger: 'tool', session: sessionTagOf(session),
       chars: summary.length, txnMs, totalMs: Date.now() - startedAt,
+      bestCandidate: diagnoseBestCandidate(summary).present,
       note: 'shadowed ' + String(result.shadowedSeqs.length) + ' nodes (seqs '
         + String(result.shadowedRange.start) + '-' + String(result.shadowedRange.end) + ')',
     })
@@ -309,6 +310,7 @@ export class AgentCompactEngine extends CompactionEngine {
       trace({
         phase: 'committed', trigger: 'marker', session: sid, seqFloor: markerSeq,
         chars: parsed.chars, txnMs, totalMs: Date.now() - startedAt,
+        bestCandidate: diagnoseBestCandidate(parsed.body).present,
         note: 'shadowed ' + String(result.shadowedSeqs.length) + ' nodes (seqs '
           + String(result.shadowedRange.start) + '-' + String(result.shadowedRange.end) + ')',
       })

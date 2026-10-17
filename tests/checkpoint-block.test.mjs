@@ -13,8 +13,10 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  BEST_CANDIDATE_MARKER,
   CHECKPOINT_SECTIONS,
   CHECKPOINT_SENTINEL,
+  diagnoseBestCandidate,
   isInsideFence,
   parseCheckpointBlock,
   formatCheckpointBlock,
@@ -161,5 +163,61 @@ describe('护栏五 · section 按序全在', () => {
       !parsed.reason.includes('近似命中'),
       '缺失那节的正文里没有近似行，报了就是恒亮——恒亮的提示等于噪音',
     )
+  })
+})
+
+// ── 最优起点诊断（论文迁移 · arXiv:2610.20563 *Scaling Discovery Requires Forgetting*）──
+//
+// 它答的问题：**「这一笔 checkpoint 留了『当前最好的是什么』，还是只留了『做过什么』」**。
+// 论文的核心操作是「丢弃 session 与搜索状态、**只留 best candidate** 并从它重启」
+// ——四个任务上比并行 agent 高 15%、比单 agent 高 39%，且**代价只有继续的一半**
+// （继续 30 提案：单 +1.6% / 并行 +1.9% / 团队 +1.4%；遗忘：+4.5% / +7.0% / +9.2%）。
+//
+// 本组尸体（缺一就是假绿）：
+//   ① **只在正文里「提到」best candidate ⇒ 不算** —— 本文件、技能、以及任何「讨论这篇论文」
+//      的会话都会出现这串字；按词匹配的判据会在那些地方**恒真**，而恒亮的判据不是证据。
+//   ② **行首但无冒号 / 裸词 ⇒ 不算**（形态不完整，读不出「在哪」）。
+//   ③ **中文形态与方括号形态都认**（单一真源在 `BEST_LINE_RE`）。
+//   ④ 诊断**不阻断**：`present=false` 也只是一句提示，压缩照常生效。
+
+describe('diagnoseBestCandidate · 显式最优起点', () => {
+  test('金标准：行首显式标记 → present，且不再给提示', () => {
+    const text = body() + '\n\n' + BEST_CANDIDATE_MARKER + ': E:/alice/x.ts:12（判据：3/3 测试绿）'
+    const got = diagnoseBestCandidate(text)
+    assert.equal(got.present, true)
+    assert.equal(got.hint, '', '命中时不该再给提示')
+  })
+
+  test('金标准：列表符号前缀 · 中文形态 · 方括号形态都认', () => {
+    assert.equal(diagnoseBestCandidate('- ' + BEST_CANDIDATE_MARKER + '：a.ts:1').present, true)
+    assert.equal(diagnoseBestCandidate('**最优产物**：a.ts:1（判据：全绿）').present, true)
+    assert.equal(diagnoseBestCandidate('[BEST]: a.ts:1').present, true)
+  })
+
+  test('尸体①：只在正文里**提到** best candidate（非行首标记）→ 不算 present', () => {
+    // ★ 本判据最该防的形状：讨论论文时必然出现这串字。
+    const discussing = body() + '\n\n论文说 best candidate 很重要，只留它就能解锁平台期。'
+    const got = diagnoseBestCandidate(discussing)
+    assert.equal(got.present, false, '按词匹配会在这里恒真 —— 判据必须是行首的结构化标记')
+    assert.match(got.hint, /没有行首的显式最优起点/)
+  })
+
+  test('尸体②：行首但缺冒号 / 裸词 → 不算（形态不完整，读不出「在哪」）', () => {
+    assert.equal(diagnoseBestCandidate(BEST_CANDIDATE_MARKER + ' E:/x.ts:1').present, false)
+    assert.equal(diagnoseBestCandidate('Best candidate: E:/x.ts:1').present, false, '裸词不算——必须是标记形态')
+  })
+
+  test('尸体③：完全不写 → 报提示，且提示里给出可照抄的形态', () => {
+    const got = diagnoseBestCandidate(body())
+    assert.equal(got.present, false)
+    assert.ok(got.hint.includes(BEST_CANDIDATE_MARKER), '提示要能直接照抄')
+  })
+
+  test('边界（诚实标注）：标记在围栏代码块内仍算 present —— 本诊断不查围栏', () => {
+    // ⚠ 与识别器**刻意不同**：`parseCheckpointBlock` 对**哨兵**查围栏（防文档误触发改写历史），
+    //   本诊断**不查**。理由：诊断**无副作用**（不压缩、不拒收），查围栏只会让判据更难读
+    //   而换不来安全。⇒ 这条边界如实写在这里，不假装它有。
+    const fenced = body() + '\n\n```\n' + BEST_CANDIDATE_MARKER + ': x.ts:1\n```'
+    assert.equal(diagnoseBestCandidate(fenced).present, true)
   })
 })
